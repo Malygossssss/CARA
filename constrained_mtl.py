@@ -2,6 +2,36 @@ import torch
 import torch.distributed as dist
 
 
+def should_restore_controller_state(restored_train_state):
+    return bool(restored_train_state)
+
+
+def maybe_load_controller_state(controller, state_dict, restored_train_state):
+    if controller is None or not should_restore_controller_state(restored_train_state):
+        return False
+    if not state_dict:
+        return False
+    controller.load_state_dict(state_dict)
+    return True
+
+
+def validate_warmup_resume_state(controller, has_controller_state, restored_train_state, start_epoch):
+    if controller is None or not controller.active:
+        return
+    if controller.ref_mode != "warmup_loss":
+        return
+    if not should_restore_controller_state(restored_train_state):
+        return
+    if has_controller_state:
+        return
+    if int(start_epoch) >= int(controller.warmup_epochs):
+        raise RuntimeError(
+            "Constrained MTL warmup_loss resume requires checkpoint extra_state.constrained_mtl "
+            f"once TRAIN.START_EPOCH ({int(start_epoch)}) reaches TRAIN.CONSTRAINED_MTL.WARMUP_EPOCHS "
+            f"({int(controller.warmup_epochs)}). Please resume from a new checkpoint that saved constrained state."
+        )
+
+
 class ConstrainedMTLController:
     DEFAULT_EPS_RELAX = 0.03
     REF_EPS = 1e-8
@@ -166,6 +196,52 @@ class ConstrainedMTLController:
             self.ref_loss_sums[task] += float(loss_value.detach().item()) * batch_weight
             self.ref_loss_counts[task] += batch_weight
 
+    def _dist_device(self):
+        if self.metric_device is not None:
+            return self.metric_device
+        if torch.cuda.is_available():
+            return torch.device("cuda", torch.cuda.current_device())
+        return torch.device("cpu")
+
+    def _sync_reference_statistics(self):
+        if not self.tasks:
+            return
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+
+        stats_values = []
+        for task in self.tasks:
+            stats_values.extend([
+                self.ref_loss_sums[task],
+                self.ref_loss_counts[task],
+            ])
+        stats_tensor = torch.tensor(
+            stats_values,
+            dtype=torch.float64,
+            device=self._dist_device(),
+        )
+        dist.all_reduce(stats_tensor, op=dist.ReduceOp.SUM)
+        reduced_values = stats_tensor.tolist()
+        for index, task in enumerate(self.tasks):
+            base = index * 2
+            self.ref_loss_sums[task] = reduced_values[base]
+            self.ref_loss_counts[task] = reduced_values[base + 1]
+
+    def _broadcast_ref_losses(self):
+        if not self.ref_losses:
+            return
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+
+        ref_tensor = torch.tensor(
+            [self.ref_losses[task] for task in self.tasks],
+            dtype=torch.float64,
+            device=self._dist_device(),
+        )
+        dist.broadcast(ref_tensor, src=0)
+        for index, task in enumerate(self.tasks):
+            self.ref_losses[task] = float(ref_tensor[index].item())
+
     def _freeze_reference_losses(self, epoch):
         if self.ref_loss_frozen:
             return False
@@ -174,6 +250,7 @@ class ConstrainedMTLController:
         if epoch < self.ref_epoch_end:
             return False
 
+        self._sync_reference_statistics()
         missing_counts = [task for task in self.tasks if self.ref_loss_counts[task] <= 0.0]
         if missing_counts:
             self._warn_once(
@@ -188,6 +265,7 @@ class ConstrainedMTLController:
         }
         self.ref_loss_frozen = True
         self.ref_loss_frozen_epoch = int(epoch)
+        self._broadcast_ref_losses()
         return True
 
     def _compute_norm_losses(self, task_losses):

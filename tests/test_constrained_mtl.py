@@ -1,9 +1,14 @@
 import unittest
+from unittest import mock
 
 import torch
 from yacs.config import CfgNode as CN
 
-from constrained_mtl import ConstrainedMTLController
+from constrained_mtl import (
+    ConstrainedMTLController,
+    maybe_load_controller_state,
+    validate_warmup_resume_state,
+)
 
 
 def build_config(
@@ -155,6 +160,81 @@ class ConstrainedMTLControllerTest(unittest.TestCase):
             restored.lambdas["sal"], controller.lambdas["sal"], places=6
         )
         self.assertAlmostEqual(restored.rho, controller.rho, places=6)
+
+    def test_old_checkpoint_without_controller_state_raises_after_warmup(self):
+        config = build_config(
+            protected_tasks=["sal"],
+            ref_mode="warmup_loss",
+            warmup_epochs=2,
+        )
+        controller = ConstrainedMTLController(config, ["main", "sal"])
+
+        with self.assertRaisesRegex(RuntimeError, "extra_state.constrained_mtl"):
+            validate_warmup_resume_state(
+                controller,
+                has_controller_state=False,
+                restored_train_state=True,
+                start_epoch=2,
+            )
+
+    def test_partial_resume_does_not_load_controller_state(self):
+        config = build_config(
+            protected_tasks=["sal"],
+            ref_mode="baseline_loss",
+            warmup_epochs=0,
+            ref_losses={"main": 2.0, "sal": 4.0},
+        )
+        controller = ConstrainedMTLController(config, ["main", "sal"])
+        state = controller.state_dict()
+        state["lambdas"]["sal"] = 1.25
+
+        loaded = maybe_load_controller_state(
+            controller,
+            state,
+            restored_train_state=False,
+        )
+
+        self.assertFalse(loaded)
+        self.assertAlmostEqual(controller.lambdas["sal"], 0.0, places=6)
+
+    def test_freeze_reference_losses_uses_global_ddp_stats(self):
+        config = build_config(
+            protected_tasks=["sal"],
+            ref_mode="warmup_loss",
+            warmup_epochs=1,
+        )
+        controller = ConstrainedMTLController(config, ["main", "sal"])
+        controller.ref_loss_sums["main"] = 1.0
+        controller.ref_loss_counts["main"] = 1.0
+        controller.ref_loss_sums["sal"] = 4.0
+        controller.ref_loss_counts["sal"] = 2.0
+
+        all_reduce_calls = []
+        broadcast_calls = []
+
+        def fake_all_reduce(tensor, op=None):
+            all_reduce_calls.append(tensor.clone())
+            tensor.copy_(torch.tensor([3.0, 2.0, 7.5, 3.0], dtype=tensor.dtype, device=tensor.device))
+
+        def fake_broadcast(tensor, src=0):
+            broadcast_calls.append((tensor.clone(), src))
+
+        with mock.patch("constrained_mtl.dist.is_available", return_value=True), \
+             mock.patch("constrained_mtl.dist.is_initialized", return_value=True), \
+             mock.patch("constrained_mtl.dist.all_reduce", side_effect=fake_all_reduce), \
+             mock.patch("constrained_mtl.dist.broadcast", side_effect=fake_broadcast), \
+             mock.patch("constrained_mtl.torch.cuda.is_available", return_value=False):
+            frozen = controller._freeze_reference_losses(0)
+
+        self.assertTrue(frozen)
+        self.assertEqual(len(all_reduce_calls), 1)
+        self.assertEqual(len(broadcast_calls), 1)
+        self.assertAlmostEqual(controller.ref_loss_sums["main"], 3.0, places=6)
+        self.assertAlmostEqual(controller.ref_loss_counts["main"], 2.0, places=6)
+        self.assertAlmostEqual(controller.ref_loss_sums["sal"], 7.5, places=6)
+        self.assertAlmostEqual(controller.ref_loss_counts["sal"], 3.0, places=6)
+        self.assertAlmostEqual(controller.ref_losses["main"], 1.5, places=6)
+        self.assertAlmostEqual(controller.ref_losses["sal"], 2.5, places=6)
 
 
 if __name__ == "__main__":

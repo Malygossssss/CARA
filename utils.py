@@ -38,7 +38,7 @@ def mkdir_if_missing(directory):
                 raise
 
 
-def load_checkpoint(config, model, optimizer, lr_scheduler, loss_scaler, logger, backbone=False, quiet=False, extra_state=None):
+def load_checkpoint(config, model, optimizer, lr_scheduler, loss_scaler, logger, backbone=False, quiet=False, extra_state=None, load_info=None):
     resume_path = config.MODEL.RESUME if not backbone else config.MODEL.RESUME_BACKBONE
     logger.info(
         f"==============> Resuming form {resume_path}....................")
@@ -163,6 +163,9 @@ def load_checkpoint(config, model, optimizer, lr_scheduler, loss_scaler, logger,
             for k in unexpected:
                 logger.warning(k)
     max_accuracy = 0.0
+    if load_info is not None:
+        load_info.clear()
+        load_info['restored_train_state'] = False
     if not config.EVAL_MODE and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint and not skip_decoder:
         optimizer.load_state_dict(checkpoint["optimizer"])
         lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
@@ -175,6 +178,8 @@ def load_checkpoint(config, model, optimizer, lr_scheduler, loss_scaler, logger,
             f"=> loaded successfully '{resume_path}' (epoch {checkpoint['epoch']})")
         if 'max_accuracy' in checkpoint:
             max_accuracy = checkpoint['max_accuracy']
+        if load_info is not None:
+            load_info['restored_train_state'] = True
     if extra_state is not None:
         extra_state.clear()
         if 'extra_state' in checkpoint and isinstance(checkpoint['extra_state'], dict):

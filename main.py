@@ -40,7 +40,11 @@ from logger import create_logger
 from utils import load_checkpoint, load_pretrained, save_checkpoint, NativeScalerWithGradNormCount, auto_resume_helper
 
 from mtl_loss_schemes import MultiTaskLoss, get_loss
-from constrained_mtl import ConstrainedMTLController
+from constrained_mtl import (
+    ConstrainedMTLController,
+    maybe_load_controller_state,
+    validate_warmup_resume_state,
+)
 from evaluation.evaluate_utils import PerformanceMeter, get_output
 from evaluation.eval_edge import eval_edge_predictions
 from ptflops import get_model_complexity_info
@@ -237,6 +241,7 @@ def main(config):
 
     max_accuracy = 0.0
     resume_extra_state = {}
+    resume_load_info = {}
 
     if config.TRAIN.AUTO_RESUME:
         resume_file = auto_resume_helper(config.OUTPUT)
@@ -253,10 +258,21 @@ def main(config):
                 f'no checkpoint found in {config.OUTPUT}, ignoring auto resume')
     if config.MODEL.RESUME:
         max_accuracy = load_checkpoint(
-            config, model_without_ddp, optimizer, lr_scheduler, loss_scaler, logger, extra_state=resume_extra_state)
+            config, model_without_ddp, optimizer, lr_scheduler, loss_scaler, logger,
+            extra_state=resume_extra_state, load_info=resume_load_info)
         if constraint_controller is not None:
-            constraint_controller.load_state_dict(
-                resume_extra_state.get("constrained_mtl"))
+            controller_state = resume_extra_state.get("constrained_mtl")
+            validate_warmup_resume_state(
+                constraint_controller,
+                isinstance(controller_state, dict),
+                resume_load_info.get("restored_train_state", False),
+                config.TRAIN.START_EPOCH,
+            )
+            maybe_load_controller_state(
+                constraint_controller,
+                controller_state,
+                resume_load_info.get("restored_train_state", False),
+            )
 
         if not config.SKIP_INITIAL_EVAL:
             validate(config, data_loader_val, model, 0)
