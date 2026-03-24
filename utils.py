@@ -38,7 +38,7 @@ def mkdir_if_missing(directory):
                 raise
 
 
-def load_checkpoint(config, model, optimizer, lr_scheduler, loss_scaler, logger, backbone=False, quiet=False):
+def load_checkpoint(config, model, optimizer, lr_scheduler, loss_scaler, logger, backbone=False, quiet=False, extra_state=None):
     resume_path = config.MODEL.RESUME if not backbone else config.MODEL.RESUME_BACKBONE
     logger.info(
         f"==============> Resuming form {resume_path}....................")
@@ -175,6 +175,10 @@ def load_checkpoint(config, model, optimizer, lr_scheduler, loss_scaler, logger,
             f"=> loaded successfully '{resume_path}' (epoch {checkpoint['epoch']})")
         if 'max_accuracy' in checkpoint:
             max_accuracy = checkpoint['max_accuracy']
+    if extra_state is not None:
+        extra_state.clear()
+        if 'extra_state' in checkpoint and isinstance(checkpoint['extra_state'], dict):
+            extra_state.update(checkpoint['extra_state'])
 
     del checkpoint
     torch.cuda.empty_cache()
@@ -282,7 +286,7 @@ def load_pretrained(config, model, logger):
     torch.cuda.empty_cache()
 
 
-def save_checkpoint(config, epoch, model, max_accuracy, optimizer, lr_scheduler, loss_scaler, logger):
+def save_checkpoint(config, epoch, model, max_accuracy, optimizer, lr_scheduler, loss_scaler, logger, extra_state=None):
     save_state = {'model': model.state_dict(),
                   'optimizer': optimizer.state_dict(),
                   'lr_scheduler': lr_scheduler.state_dict(),
@@ -290,6 +294,8 @@ def save_checkpoint(config, epoch, model, max_accuracy, optimizer, lr_scheduler,
                   'scaler': loss_scaler.state_dict(),
                   'epoch': epoch,
                   'config': config}
+    if extra_state is not None:
+        save_state['extra_state'] = extra_state
 
     save_name = f'ckpt_epoch_{epoch}.pth'
     save_path = os.path.join(config.OUTPUT, save_name)

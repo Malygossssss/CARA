@@ -40,6 +40,7 @@ from logger import create_logger
 from utils import load_checkpoint, load_pretrained, save_checkpoint, NativeScalerWithGradNormCount, auto_resume_helper
 
 from mtl_loss_schemes import MultiTaskLoss, get_loss
+from constrained_mtl import ConstrainedMTLController
 from evaluation.evaluate_utils import PerformanceMeter, get_output
 from evaluation.eval_edge import eval_edge_predictions
 from ptflops import get_model_complexity_info
@@ -216,7 +217,26 @@ def main(config):
 
         criterion = MultiTaskLoss(config.TASKS, loss_ft, loss_weights)
 
+    constraint_controller = None
+    if config.MTL:
+        constraint_controller = ConstrainedMTLController(
+            config, config.TASKS, logger=logger)
+        if config.TRAIN.CONSTRAINED_MTL.ENABLED:
+            if constraint_controller.active:
+                logger.info(
+                    "Constrained MTL enabled with protected tasks %s (objective=%s, ref_mode=%s, warmup_epochs=%d)",
+                    constraint_controller.protected_tasks,
+                    constraint_controller.objective_mode,
+                    constraint_controller.ref_mode,
+                    constraint_controller.warmup_epochs,
+                )
+            else:
+                logger.info(
+                    "Constrained MTL requested but no protected tasks are active; training will use the baseline weighted-sum loss."
+                )
+
     max_accuracy = 0.0
+    resume_extra_state = {}
 
     if config.TRAIN.AUTO_RESUME:
         resume_file = auto_resume_helper(config.OUTPUT)
@@ -233,7 +253,10 @@ def main(config):
                 f'no checkpoint found in {config.OUTPUT}, ignoring auto resume')
     if config.MODEL.RESUME:
         max_accuracy = load_checkpoint(
-            config, model_without_ddp, optimizer, lr_scheduler, loss_scaler, logger)
+            config, model_without_ddp, optimizer, lr_scheduler, loss_scaler, logger, extra_state=resume_extra_state)
+        if constraint_controller is not None:
+            constraint_controller.load_state_dict(
+                resume_extra_state.get("constrained_mtl"))
 
         if not config.SKIP_INITIAL_EVAL:
             validate(config, data_loader_val, model, 0)
@@ -313,14 +336,26 @@ def main(config):
     total_cr_sum = 0.0
     total_cr_count = 0.0
 
-    epoch = 0
-    for epoch in range(config.TRAIN.EPOCHS):
+    epoch = config.TRAIN.START_EPOCH
+    for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
         if not config.MTL:
             data_loader_train.sampler.set_epoch(epoch)
 
         epoch_cr_records, epoch_cr_sum, epoch_cr_count = train_one_epoch(config, model, criterion, data_loader_train,
                                                                          optimizer, epoch, mixup_fn, lr_scheduler,
-                                                                         loss_scaler, teacher=teacher)
+                                                                         loss_scaler, teacher=teacher,
+                                                                         constraint_controller=constraint_controller)
+        constraint_epoch_summary = None
+        if constraint_controller is not None:
+            constraint_epoch_summary = constraint_controller.on_epoch_end(epoch)
+            if constraint_epoch_summary is not None:
+                constraint_summary_text = constraint_controller.format_epoch_summary(
+                    constraint_epoch_summary)
+                if constraint_summary_text:
+                    logger.info(f"ConstrainedMTL Epoch: {constraint_summary_text}")
+                if wandb_available:
+                    wandb.log(_flatten_constrained_epoch_metrics(
+                        constraint_epoch_summary, epoch))
         if config.TRAIN.ENABLE_CONFLICT_RATIO:
             total_cr_sum += epoch_cr_sum
             total_cr_count += epoch_cr_count
@@ -328,7 +363,8 @@ def main(config):
                 all_batch_cr_records.extend(epoch_cr_records)
         if dist.get_rank() == 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
             save_checkpoint(config, epoch, model_without_ddp, max_accuracy, optimizer, lr_scheduler, loss_scaler,
-                            logger)
+                            logger,
+                            extra_state={'constrained_mtl': constraint_controller.state_dict()} if constraint_controller is not None else None)
         if epoch % config.EVAL_FREQ == 0 or (not args.no_eval_50 and epoch == 50):
             if config.MTL:
                 validate(config, data_loader_val, model, epoch)
@@ -368,6 +404,59 @@ def _get_dist_rank():
     if dist.is_available() and dist.is_initialized():
         return dist.get_rank()
     return 0
+
+
+def _flatten_constrained_step_metrics(step_metrics):
+    if not step_metrics:
+        return {}
+
+    metrics = {
+        "train/constrained/alm_rho": step_metrics["alm_rho"],
+        "train/constrained/ref_loss_frozen": float(bool(step_metrics["ref_loss"])),
+    }
+    if step_metrics["objective_loss"] is not None:
+        metrics["train/constrained/objective_loss"] = step_metrics["objective_loss"]
+    metrics["train/constrained/constrained_total_loss"] = step_metrics["constrained_total_loss"]
+
+    for task, value in step_metrics["ref_loss"].items():
+        metrics[f"train/constrained/ref_loss/{task}"] = value
+    for task, value in step_metrics["norm_loss"].items():
+        metrics[f"train/constrained/norm_loss/{task}"] = value
+    for task, value in step_metrics["violation"].items():
+        metrics[f"train/constrained/violation/{task}"] = value
+    for task, value in step_metrics["pos_violation"].items():
+        metrics[f"train/constrained/pos_violation/{task}"] = value
+    for task, value in step_metrics["lambda"].items():
+        metrics[f"train/constrained/lambda/{task}"] = value
+    for task, value in step_metrics["constraint_satisfied"].items():
+        metrics[f"train/constrained/constraint_satisfied/{task}"] = value
+
+    return metrics
+
+
+def _flatten_constrained_epoch_metrics(epoch_summary, epoch):
+    if not epoch_summary:
+        return {}
+
+    metrics = {
+        "train/constrained_epoch/epoch": epoch,
+        "train/constrained_epoch/alm_rho": epoch_summary["alm_rho"],
+        "train/constrained_epoch/ref_loss_frozen": float(epoch_summary["ref_loss_frozen"]),
+    }
+    if epoch_summary.get("ref_loss_frozen_epoch") is not None:
+        metrics["train/constrained_epoch/ref_loss_frozen_epoch"] = float(
+            epoch_summary["ref_loss_frozen_epoch"])
+
+    for task, value in epoch_summary.get("ref_loss", {}).items():
+        metrics[f"train/constrained_epoch/ref_loss/{task}"] = value
+    for task, value in epoch_summary.get("epoch_avg_violation", {}).items():
+        metrics[f"train/constrained_epoch/epoch_avg_violation/{task}"] = value
+    for task, value in epoch_summary.get("epoch_avg_pos_violation", {}).items():
+        metrics[f"train/constrained_epoch/epoch_avg_pos_violation/{task}"] = value
+    for task, value in epoch_summary.get("lambda_after_update", {}).items():
+        metrics[f"train/constrained_epoch/lambda_after_update/{task}"] = value
+
+    return metrics
 
 
 def _prepare_edge_eval_cache(output_dir, epoch):
@@ -492,7 +581,7 @@ def _compute_conflict_ratio(loss_dict, shared_params, task_order, task_weights):
     return float(sum(ratios) / len(ratios))
 
 
-def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler, loss_scaler, task=None, teacher=None):
+def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler, loss_scaler, task=None, teacher=None, constraint_controller=None):
     model.train()
     optimizer.zero_grad()
 
@@ -559,6 +648,10 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
         with torch.cuda.amp.autocast(enabled=config.AMP_ENABLE):
             outputs = model(samples)
             loss, loss_dict = criterion(outputs, targets)
+        constraint_metrics = None
+        if constraint_controller is not None:
+            loss, constraint_metrics = constraint_controller.compute_loss(
+                loss_dict, loss, epoch, samples.size(0))
 
         if config.DEBUG_REPRO_STEPS > 0 and idx < config.DEBUG_REPRO_STEPS and dist.get_rank() == 0:
             sample_mean = float(samples.mean().item())
@@ -674,6 +767,9 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
             if loss_dict is not None:
                 for task, task_loss in loss_dict.items():
                     metrics[f"train/tasks/{task}/loss"] = task_loss.item()
+            if constraint_metrics is not None:
+                metrics.update(_flatten_constrained_step_metrics(
+                    constraint_metrics))
             wandb.log(metrics)
 
         if idx % config.PRINT_FREQ == 0:
@@ -689,6 +785,11 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
                 f'grad_norm {norm_meter.val:.4f} ({norm_meter.avg:.4f})\t'
                 f'loss_scale {scaler_meter.val:.4f} ({scaler_meter.avg:.4f})\t'
                 f'mem {memory_used:.0f}MB')
+            if constraint_metrics is not None:
+                constraint_summary_text = constraint_controller.format_step_summary(
+                    constraint_metrics)
+                if constraint_summary_text:
+                    logger.info(f"ConstrainedMTL: {constraint_summary_text}")
 
     if config.EVAL_TRAINING is not None and (epoch % config.EVAL_TRAINING == 0):
         print("Training Eval:")
