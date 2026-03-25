@@ -36,6 +36,7 @@ class ConstrainedMTLController:
     DEFAULT_EPS_RELAX = 0.03
     REF_EPS = 1e-8
     RHO_GROWTH_THRESHOLD = 1e-4
+    REF_TAIL_EPOCHS = 10
 
     def __init__(self, config, tasks, logger=None):
         cfg = config.TRAIN.CONSTRAINED_MTL
@@ -67,13 +68,19 @@ class ConstrainedMTLController:
             raise ValueError(f"Unsupported constrained ref mode '{self.ref_mode}'.")
 
         self.warmup_epochs = max(int(cfg.WARMUP_EPOCHS), 0)
-        self.ref_epoch_start = int(cfg.REF_EPOCH_START)
+        ref_epoch_start = int(cfg.REF_EPOCH_START)
         ref_epoch_end = int(cfg.REF_EPOCH_END)
-        if self.ref_mode == "warmup_loss" and ref_epoch_end <= self.ref_epoch_start:
-            if self.ref_epoch_start == 0 and ref_epoch_end == 0:
+        if self.ref_mode == "warmup_loss" and ref_epoch_end <= ref_epoch_start:
+            if ref_epoch_start == 0 and ref_epoch_end == 0:
                 ref_epoch_end = max(self.warmup_epochs - 1, 0)
             else:
-                ref_epoch_end = self.ref_epoch_start
+                ref_epoch_end = ref_epoch_start
+        if self.ref_mode == "warmup_loss":
+            ref_epoch_start = max(
+                ref_epoch_start,
+                ref_epoch_end - self.REF_TAIL_EPOCHS + 1,
+            )
+        self.ref_epoch_start = ref_epoch_start
         self.ref_epoch_end = ref_epoch_end
 
         self.use_relative_loss = True

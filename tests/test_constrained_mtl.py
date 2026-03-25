@@ -109,6 +109,34 @@ class ConstrainedMTLControllerTest(unittest.TestCase):
         self.assertAlmostEqual(epoch_summary["epoch_avg_violation"]["sal"], 0.07, places=6)
         self.assertAlmostEqual(epoch_summary["lambda_after_update"]["sal"], 0.0035, places=6)
 
+    def test_warmup_reference_uses_last_ten_epochs(self):
+        config = build_config(
+            protected_tasks=["sal"],
+            ref_mode="warmup_loss",
+            warmup_epochs=12,
+        )
+        controller = ConstrainedMTLController(config, ["main", "sal"])
+
+        self.assertEqual(controller.ref_epoch_start, 2)
+        self.assertEqual(controller.ref_epoch_end, 11)
+
+        for epoch in range(12):
+            main_loss = float(epoch + 1)
+            sal_loss = float((epoch + 1) * 2)
+            baseline_total = torch.tensor(main_loss + sal_loss, requires_grad=True)
+            controller.compute_loss(
+                build_loss_dict(main_loss, sal_loss),
+                baseline_total,
+                epoch=epoch,
+                batch_size=1,
+            )
+
+        warmup_summary = controller.on_epoch_end(11)
+
+        self.assertTrue(warmup_summary["ref_loss_frozen"])
+        self.assertAlmostEqual(warmup_summary["ref_loss"]["main"], 7.5, places=6)
+        self.assertAlmostEqual(warmup_summary["ref_loss"]["sal"], 15.0, places=6)
+
     def test_objective_falls_back_to_avg_all_when_no_unconstrained_tasks(self):
         config = build_config(
             protected_tasks=["main", "sal"],
