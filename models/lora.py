@@ -172,6 +172,7 @@ class MTLoRALinear(LoRALayer):
         trainable_scale_shared=False,
         trainable_scale_per_task=False,
         shared_mode: str = 'matrix',
+        layer_idx: int = -1,
         **kwargs,
     ):
         assert shared_mode in ['matrix', 'matrixv2',
@@ -193,6 +194,8 @@ class MTLoRALinear(LoRALayer):
 
         self.linear = torch.nn.Linear(
             in_features, out_features, **kwargs)
+        self.layer_idx = layer_idx
+        self.shared_lora_enabled = True
 
         self.tasks = tasks
         self.shared_mode = shared_mode
@@ -262,6 +265,9 @@ class MTLoRALinear(LoRALayer):
         """Merges the LoRA weights into the full-rank weights (W = W + delta_W)."""
         raise NotImplementedError
 
+    def set_shared_lora_enabled(self, enabled: bool) -> None:
+        self.shared_lora_enabled = bool(enabled)
+
     def forward(self, x: torch.Tensor, x_tasks: Dict[str, torch.Tensor] = None):
         # TODO: handle merging
         pretrained = self.linear(x)
@@ -279,7 +285,7 @@ class MTLoRALinear(LoRALayer):
                 for task in self.lora_tasks_A.keys()
             }
 
-        if self.has_shared_lora:
+        if self.has_shared_lora and self.shared_lora_enabled:
             if self.shared_mode == 'matrix':
                 lora = (x @ self.lora_shared_A.transpose(0, 1)
                         @ self.lora_shared_B.transpose(0, 1)) * self.lora_shared_scale
@@ -315,18 +321,22 @@ class MTLoRAQKV(LoRALayer):
         trainable_scale_shared=False,
         trainable_scale_per_task=False,
         shared_mode: str = 'matrix',
+        layer_idx: int = -1,
         **kwargs,
     ):
         if isinstance(r, int):
             r = {'shared': r}
         super().__init__(r=r, lora_alpha=lora_shared_scale, lora_dropout=lora_dropout)
         self.tasks = tasks
+        self.layer_idx = layer_idx
         self.q = MTLoRALinear(in_features, out_features, r=r, lora_shared_scale=lora_shared_scale, lora_task_scale=lora_task_scale, lora_dropout=lora_dropout,
-                              tasks=tasks, trainable_scale_shared=trainable_scale_shared, trainable_scale_per_task=trainable_scale_per_task, shared_mode=shared_mode, **kwargs)
+                              tasks=tasks, trainable_scale_shared=trainable_scale_shared, trainable_scale_per_task=trainable_scale_per_task, shared_mode=shared_mode, layer_idx=layer_idx, **kwargs)
         self.k = MTLoRALinear(in_features, out_features, r=r, lora_shared_scale=lora_shared_scale, lora_task_scale=lora_task_scale, lora_dropout=lora_dropout,
-                              tasks=tasks, trainable_scale_shared=trainable_scale_shared, trainable_scale_per_task=trainable_scale_per_task, shared_mode=shared_mode, **kwargs)
+                              tasks=tasks, trainable_scale_shared=trainable_scale_shared, trainable_scale_per_task=trainable_scale_per_task, shared_mode=shared_mode, layer_idx=layer_idx, **kwargs)
         self.v = MTLoRALinear(in_features, out_features, r=r, lora_shared_scale=lora_shared_scale, lora_task_scale=lora_task_scale, lora_dropout=lora_dropout,
-                              tasks=tasks, trainable_scale_shared=trainable_scale_shared, trainable_scale_per_task=trainable_scale_per_task, shared_mode=shared_mode, **kwargs)
+                              tasks=tasks, trainable_scale_shared=trainable_scale_shared, trainable_scale_per_task=trainable_scale_per_task, shared_mode=shared_mode, layer_idx=layer_idx, **kwargs)
+        self.has_shared_lora = any(getattr(module, "has_shared_lora", False) for module in (self.q, self.k, self.v))
+        self.shared_lora_enabled = True
 
     def reset_parameters(self):
         self.q.reset_parameters()
@@ -335,6 +345,12 @@ class MTLoRAQKV(LoRALayer):
 
     def merge(self):
         raise NotImplementedError
+
+    def set_shared_lora_enabled(self, enabled: bool) -> None:
+        self.shared_lora_enabled = bool(enabled)
+        self.q.set_shared_lora_enabled(enabled)
+        self.k.set_shared_lora_enabled(enabled)
+        self.v.set_shared_lora_enabled(enabled)
 
     def forward(self, x: torch.Tensor, x_tasks: Dict[str, torch.Tensor] = None):
         return (torch.cat([self.q(x, x_tasks)[0], self.k(x, x_tasks)[0], self.v(x, x_tasks)[0]], dim=-1),

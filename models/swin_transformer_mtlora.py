@@ -16,6 +16,7 @@
 import torch
 from torch import Tensor
 import torch.nn as nn
+from contextlib import contextmanager
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from models.lora import MTLoRALinear, MTLoRAQKV
 
@@ -70,6 +71,7 @@ class Mlp(nn.Module):
                 trainable_scale_shared=mtlora.TRAINABLE_SCALE_SHARED,
                 trainable_scale_per_task=mtlora.TRAINABLE_SCALE_PER_TASK,
                 shared_mode=mtlora.SHARED_MODE,
+                layer_idx=layer_idx,
             )
         else:
             self.fc1 = CompatLinear(in_features, hidden_features)
@@ -86,6 +88,7 @@ class Mlp(nn.Module):
                 trainable_scale_shared=mtlora.TRAINABLE_SCALE_SHARED,
                 trainable_scale_per_task=mtlora.TRAINABLE_SCALE_PER_TASK,
                 shared_mode=mtlora.SHARED_MODE,
+                layer_idx=layer_idx,
             )
         else:
             self.fc2 = CompatLinear(hidden_features, out_features)
@@ -202,6 +205,7 @@ class WindowAttention(nn.Module):
                     trainable_scale_shared=mtlora.TRAINABLE_SCALE_SHARED,
                     trainable_scale_per_task=mtlora.TRAINABLE_SCALE_PER_TASK,
                     shared_mode=mtlora.SHARED_MODE,
+                    layer_idx=layer_idx,
                 )
             else:
                 linear_cls = MTLoRALinear
@@ -217,6 +221,7 @@ class WindowAttention(nn.Module):
                     trainable_scale_shared=mtlora.TRAINABLE_SCALE_SHARED,
                     trainable_scale_per_task=mtlora.TRAINABLE_SCALE_PER_TASK,
                     shared_mode=mtlora.SHARED_MODE,
+                    layer_idx=layer_idx,
                     )
         else:
             self.qkv = CompatLinear(dim, dim * 3, bias=qkv_bias)
@@ -236,6 +241,7 @@ class WindowAttention(nn.Module):
                 trainable_scale_shared=mtlora.TRAINABLE_SCALE_SHARED,
                 trainable_scale_per_task=mtlora.TRAINABLE_SCALE_PER_TASK,
                 shared_mode=mtlora.SHARED_MODE,
+                layer_idx=layer_idx,
             )
         else:
             self.proj = CompatLinear(dim, dim)
@@ -516,6 +522,7 @@ class PatchMerging(nn.Module):
                 trainable_scale_shared=mtlora.TRAINABLE_SCALE_SHARED,
                 trainable_scale_per_task=mtlora.TRAINABLE_SCALE_PER_TASK,
                 shared_mode=mtlora.SHARED_MODE,
+                layer_idx=layer_idx,
                 )
         else:
             self.reduction = CompatLinear(4 * dim, 2 * dim, bias=False)
@@ -804,6 +811,33 @@ class SwinTransformerMTLoRA(nn.Module):
     @torch.jit.ignore
     def no_weight_decay_keywords(self):
         return {'relative_position_bias_table'}
+
+    def iter_mtlora_modules(self, layer_idx=None):
+        for module in self.modules():
+            if not isinstance(module, (MTLoRALinear, MTLoRAQKV)):
+                continue
+            if layer_idx is not None and getattr(module, "layer_idx", None) != layer_idx:
+                continue
+            yield module
+
+    def set_shared_lora_enabled(self, layer_idx, enabled: bool) -> None:
+        for module in self.iter_mtlora_modules(layer_idx=layer_idx):
+            if hasattr(module, "set_shared_lora_enabled"):
+                module.set_shared_lora_enabled(enabled)
+
+    @contextmanager
+    def disable_shared_lora(self, layer_idx):
+        affected = []
+        for module in self.iter_mtlora_modules(layer_idx=layer_idx):
+            if not getattr(module, "has_shared_lora", False):
+                continue
+            affected.append((module, getattr(module, "shared_lora_enabled", True)))
+            module.set_shared_lora_enabled(False)
+        try:
+            yield
+        finally:
+            for module, enabled in affected:
+                module.set_shared_lora_enabled(enabled)
 
     def forward_features(self, x, return_stages=False, flatten_ft=False):
         x = self.patch_embed(x)

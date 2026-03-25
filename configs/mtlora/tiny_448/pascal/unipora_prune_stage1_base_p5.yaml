@@ -1,0 +1,20 @@
+BASE: ['promlora_tiny_448_r64_prom50_scale4_pertask.yaml']
+TAG: unipora_ta_prompt_pruning
+PRUNING:
+  ENABLED: True
+  EXPERIMENT_NAME: unipora_prune_stage1_base_p5
+  COMPUTE_IMPORTANCE: True
+  APPLY_PRUNING: True
+  RUN_RECOVERY: False
+  EVALUATE_AFTER_PRUNING: True
+  IMPORTANCE:
+    TYPE: base
+    SOURCE: val
+    NUM_BATCHES: 8
+    GA_EPS: 1.0e-6
+  PRUNER:
+    RATIO: 0.05
+    MIN_TOKENS_PER_LAYER: 1
+  DISTILL:
+    LOGIT_WEIGHT: 0.0
+    FEATURE_WEIGHT: 0.0

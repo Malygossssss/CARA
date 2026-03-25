@@ -1,0 +1,32 @@
+BASE: ['promlora_tiny_448_r64_prom50_scale4_pertask.yaml']
+TAG: unipora_ta_prompt_pruning
+SAVE_FREQ: 1
+EVAL_FREQ: 1
+TRAIN:
+  WARMUP_EPOCHS: 0
+PRUNING:
+  ENABLED: True
+  EXPERIMENT_NAME: unipora_prune_stage2_base_recover_p10
+  COMPUTE_IMPORTANCE: True
+  APPLY_PRUNING: True
+  RUN_RECOVERY: True
+  EVALUATE_AFTER_PRUNING: True
+  EVALUATE_AFTER_RECOVERY: True
+  IMPORTANCE:
+    TYPE: base
+    SOURCE: val
+    NUM_BATCHES: 8
+    GA_EPS: 1.0e-6
+  PRUNER:
+    RATIO: 0.10
+    MIN_TOKENS_PER_LAYER: 1
+  RECOVERY:
+    EPOCHS: 5
+    FREEZE_BACKBONE: True
+    FREEZE_GALORA: True
+    TRAIN_TA_PROMPT: True
+    TRAIN_TASK_HEADS: True
+    UNFREEZE_GALORA_LAST_N: 0
+  DISTILL:
+    LOGIT_WEIGHT: 0.5
+    FEATURE_WEIGHT: 0.0

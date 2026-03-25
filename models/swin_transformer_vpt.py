@@ -307,6 +307,9 @@ class PromptedSwinTransformer(SwinTransformerMTLoRA):
         else:
             raise ValueError("Other initiation scheme is not supported")
 
+        self.reset_prompt_pruning()
+        self.clear_prompt_runtime_gates()
+
     def forward(self, x, task=None, return_stages=False, flatten_ft=False):
         x = self.forward_features(x, task, return_stages)
         if return_stages:
@@ -323,7 +326,11 @@ class PromptedSwinTransformer(SwinTransformerMTLoRA):
         if self.prompt_config.LOCATION == "prepend":
             x = self.get_patch_embeddings(x)
             prompt_embd = self.prompt_dropout(
-                self._select_prompt(self.prompt_embeddings, task).expand(B, -1, -1)
+                self._select_layer_prompt(
+                    self._select_prompt(self.prompt_embeddings, task),
+                    task,
+                    layer_idx=0,
+                ).expand(B, -1, -1)
             )
             x = torch.cat((prompt_embd, x), dim=1)
 
@@ -395,7 +402,7 @@ class PromptedSwinTransformer(SwinTransformerMTLoRA):
         task_idx = self.task_to_idx[task]
         weights = F.softmax(gates[:, task_idx, :, :], dim=-1)
         composed = torch.einsum("bts,bsd->btd", weights, pool)
-        return composed
+        return self._select_layer_prompt(composed, task, layer_idx)
 
     def get_patch_embeddings(self, x):
         x = self.patch_embed(x)
@@ -407,6 +414,117 @@ class PromptedSwinTransformer(SwinTransformerMTLoRA):
     def _select_prompt(self, prompt_dict, task):
         key = "shared" if self.share_task_prompt else task
         return prompt_dict[key]
+
+    def _resolve_prompt_key(self, task):
+        return "shared" if self.share_task_prompt else task
+
+    def _get_prompt_token_count(self, layer_idx, task):
+        key = self._resolve_prompt_key(task)
+        if self.prompt_config.LOCATION == "pad":
+            return int(self.num_tokens)
+        if layer_idx == 0:
+            return int(self._select_prompt(self.prompt_embeddings, key).shape[1])
+        if not getattr(self.prompt_config, "DEEP", False):
+            return int(self._select_prompt(self.prompt_embeddings, key).shape[1]) if hasattr(self, "prompt_embeddings") else int(self.num_tokens)
+        if getattr(self, "use_dynamic_prompts", False):
+            return int(self.deep_prompt_gates[layer_idx].shape[2])
+        return int(self._select_prompt(self.deep_prompt_embeddings[layer_idx], key).shape[1])
+
+    def _get_stage_prompt_count(self, task, layer_idx):
+        key = self._resolve_prompt_key(task)
+        layer_indices = self._prompt_active_indices.get(key, {})
+        if layer_idx not in layer_indices:
+            return 0
+        return int(layer_indices[layer_idx].numel())
+
+    def reset_prompt_pruning(self):
+        self._prompt_active_indices = {}
+        for key in self.prompt_keys:
+            self._prompt_active_indices[key] = {}
+            for layer_idx in range(self.num_layers):
+                token_count = self._get_prompt_token_count(layer_idx, key)
+                self._prompt_active_indices[key][layer_idx] = torch.arange(
+                    token_count, dtype=torch.long
+                )
+
+    def set_prompt_pruning(self, keep_indices):
+        updated = {}
+        for key in self.prompt_keys:
+            source = keep_indices.get(key, keep_indices.get("shared", {}))
+            updated[key] = {}
+            for layer_idx in range(self.num_layers):
+                default_indices = torch.arange(
+                    self._get_prompt_token_count(layer_idx, key), dtype=torch.long
+                )
+                indices = source.get(layer_idx, source.get(str(layer_idx), default_indices))
+                if isinstance(indices, torch.Tensor):
+                    tensor_indices = indices.detach().cpu().long()
+                else:
+                    tensor_indices = torch.tensor(indices, dtype=torch.long)
+                updated[key][layer_idx] = tensor_indices
+        self._prompt_active_indices = updated
+
+    def export_prompt_pruning(self):
+        return {
+            key: {
+                int(layer_idx): indices.detach().cpu().tolist()
+                for layer_idx, indices in layer_map.items()
+            }
+            for key, layer_map in self._prompt_active_indices.items()
+        }
+
+    def clear_prompt_runtime_gates(self):
+        self._prompt_runtime_gates = None
+
+    def set_prompt_runtime_gates(self, gates):
+        self._prompt_runtime_gates = gates
+
+    def build_prompt_runtime_gates(self, device=None, requires_grad=True):
+        if device is None:
+            device = next(self.parameters()).device
+        runtime_gates = {}
+        for key in self.prompt_keys:
+            runtime_gates[key] = {}
+            for layer_idx in range(self.num_layers):
+                token_count = self._get_prompt_token_count(layer_idx, key)
+                gate = torch.ones(
+                    token_count,
+                    device=device,
+                    dtype=next(self.parameters()).dtype,
+                    requires_grad=requires_grad,
+                )
+                runtime_gates[key][layer_idx] = gate
+        return runtime_gates
+
+    def _get_layer_indices(self, task, layer_idx, device):
+        key = self._resolve_prompt_key(task)
+        layer_indices = self._prompt_active_indices.get(key, {})
+        if layer_idx not in layer_indices:
+            return None
+        return layer_indices[layer_idx].to(device)
+
+    def _get_layer_gate(self, task, layer_idx, device, indices=None):
+        if self._prompt_runtime_gates is None:
+            return None
+        key = self._resolve_prompt_key(task)
+        gate_map = self._prompt_runtime_gates.get(key)
+        if gate_map is None and self.share_task_prompt:
+            gate_map = self._prompt_runtime_gates.get("shared")
+        if gate_map is None or layer_idx not in gate_map:
+            return None
+        gate = gate_map[layer_idx].to(device)
+        if indices is not None:
+            gate = gate.index_select(0, indices.to(gate.device))
+        return gate
+
+    def _select_layer_prompt(self, prompt_tensor, task, layer_idx):
+        indices = self._get_layer_indices(task, layer_idx, prompt_tensor.device)
+        if indices is not None:
+            prompt_tensor = prompt_tensor.index_select(1, indices)
+        gate = self._get_layer_gate(task, layer_idx, prompt_tensor.device, indices=indices)
+        if gate is not None:
+            prompt_tensor = prompt_tensor * gate.view(1, -1, 1)
+        return prompt_tensor
 
     def train(self, mode=True):
         if mode and not getattr(self.mtlora, "ENABLED", False):
@@ -430,19 +548,28 @@ class PromptedSwinTransformer(SwinTransformerMTLoRA):
                     )
                 else:
                     deep_prompt_embd = self.prompt_dropout(
-                        self._select_prompt(
-                            self.deep_prompt_embeddings[layer_idx], task
+                        self._select_layer_prompt(
+                            self._select_prompt(
+                                self.deep_prompt_embeddings[layer_idx], task
+                            ),
+                            task,
+                            layer_idx,
                         )
                     )
                 x = layer(x, task, deep_prompt_embd)
                 if return_stages:
-                    feats.append(x[:, self.num_tokens:, :])
+                    prompt_count = self._get_stage_prompt_count(task, layer_idx)
+                    feats.append(x[:, prompt_count:, :])
         else:
-            for layer in self.layers:
+            for layer_idx, layer in enumerate(self.layers):
                 x = layer(x, task)
                 if return_stages:
                     if self.prompt_config.LOCATION == "prepend":
-                        feats.append(x[:, self.num_tokens:, :])
+                        prompt_count = self._get_stage_prompt_count(
+                            task,
+                            layer_idx if self.prompt_config.DEEP else 0,
+                        )
+                        feats.append(x[:, prompt_count:, :])
                     else:
                         feats.append(x)
         if self.norm is not None:
@@ -450,7 +577,8 @@ class PromptedSwinTransformer(SwinTransformerMTLoRA):
         if return_stages:
             return feats
         if self.prompt_config.LOCATION == "prepend":
-            x = x[:, self.num_tokens:, :]
+            last_layer_idx = self.num_layers - 1 if self.prompt_config.DEEP else 0
+            x = x[:, self._get_stage_prompt_count(task, last_layer_idx):, :]
         x = self.avgpool(x.transpose(1, 2))
         x = torch.flatten(x, 1)
         return x
@@ -544,6 +672,9 @@ class PromptedBasicLayer(nn.Module):
         if self.deep_prompt and deep_prompt_embd is None and self.prompt_location == "prepend":
             raise ValueError("need deep_prompt embeddings")
 
+        prompt_count = x.shape[1] - (self.input_resolution[0] * self.input_resolution[1]) \
+            if self.prompt_location == "prepend" else 0
+
         if not self.deep_prompt:
             for blk in self.blocks:
                 x, tasks_lora = blk(x)
@@ -560,14 +691,14 @@ class PromptedBasicLayer(nn.Module):
                             x = tasks_lora[task]
                     else:
                         prompt_emb = deep_prompt_embd[i - 1].expand(B, -1, -1)
-                        x = torch.cat((prompt_emb, x[:, self.num_prompts:, :]), dim=1)
+                        x = torch.cat((prompt_emb, x[:, prompt_count:, :]), dim=1)
                         x, tasks_lora = self.blocks[i](x)
                         if tasks_lora is not None:
                             x = tasks_lora[task]
             else:
                 for i in range(num_blocks):
                     prompt_emb = deep_prompt_embd[i].expand(B, -1, -1)
-                    x = torch.cat((prompt_emb, x[:, self.num_prompts:, :]), dim=1)
+                    x = torch.cat((prompt_emb, x[:, prompt_count:, :]), dim=1)
                     x, tasks_lora = self.blocks[i](x)
                     if tasks_lora is not None:
                         x = tasks_lora[task]
@@ -614,12 +745,13 @@ class PromptedPatchMerging(PatchMerging):
         """
         H, W = self.input_resolution
         B, L, C = x.shape
+        prompt_count = L - (H * W) if self.prompt_location == "prepend" else 0
 
         if self.prompt_location == "prepend":
             # change input size
-            prompt_emb = x[:, :self.num_prompts, :]
-            x = x[:, self.num_prompts:, :]
-            L = L - self.num_prompts
+            prompt_emb = x[:, :prompt_count, :]
+            x = x[:, prompt_count:, :]
+            L = L - prompt_count
             prompt_emb = self.upsample_prompt(prompt_emb)
 
         assert L == H * W, "input feature has wrong size, should be {}, got {}".format(H*W, L)
@@ -711,11 +843,12 @@ class PromptedSwinTransformerBlock(SwinTransformerBlock):
         B, L, C = x.shape
         shortcut = x
         x = self.norm1(x)
+        prompt_count = L - (H * W) if self.prompt_location == "prepend" else 0
 
         if self.prompt_location == "prepend":
-            prompt_emb = x[:, :self.num_prompts, :]
-            x = x[:, self.num_prompts:, :]
-            L = L - self.num_prompts
+            prompt_emb = x[:, :prompt_count, :]
+            x = x[:, prompt_count:, :]
+            L = L - prompt_count
 
         assert L == H * W, "input feature has wrong size, should be {}, got {}".format(H * W, L)
 
@@ -733,22 +866,22 @@ class PromptedSwinTransformerBlock(SwinTransformerBlock):
         if self.prompt_location == "prepend":
             prompt_emb = prompt_emb.unsqueeze(0)
             prompt_emb = prompt_emb.expand(num_windows, -1, -1, -1)
-            prompt_emb = prompt_emb.reshape((-1, self.num_prompts, C))
+            prompt_emb = prompt_emb.reshape((-1, prompt_count, C))
             x_windows = torch.cat((prompt_emb, x_windows), dim=1)
 
         attn_windows, attn_windows_lora_tasks = self.attn(x_windows, mask=self.attn_mask)
 
         prompt_emb_lora_tasks = {}
         if self.prompt_location == "prepend":
-            prompt_emb = attn_windows[:, :self.num_prompts, :]
-            attn_windows = attn_windows[:, self.num_prompts:, :]
-            prompt_emb = prompt_emb.view(-1, B, self.num_prompts, C)
+            prompt_emb = attn_windows[:, :prompt_count, :]
+            attn_windows = attn_windows[:, prompt_count:, :]
+            prompt_emb = prompt_emb.view(-1, B, prompt_count, C)
             prompt_emb = prompt_emb.mean(0)
             if attn_windows_lora_tasks is not None:
                 for task in self.tasks:
-                    prompt_emb_lora_tasks[task] = attn_windows_lora_tasks[task][:, :self.num_prompts, :]
-                    attn_windows_lora_tasks[task] = attn_windows_lora_tasks[task][:, self.num_prompts:, :]
-                    prompt_emb_lora_tasks[task] = prompt_emb_lora_tasks[task].view(-1, B, self.num_prompts, C)
+                    prompt_emb_lora_tasks[task] = attn_windows_lora_tasks[task][:, :prompt_count, :]
+                    attn_windows_lora_tasks[task] = attn_windows_lora_tasks[task][:, prompt_count:, :]
+                    prompt_emb_lora_tasks[task] = prompt_emb_lora_tasks[task].view(-1, B, prompt_count, C)
                     prompt_emb_lora_tasks[task] = prompt_emb_lora_tasks[task].mean(0)
 
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
@@ -837,6 +970,11 @@ class PromptedWindowAttention(WindowAttention):
 
     def forward(self, x, mask=None):
         B_, N, C = x.shape
+        prompt_count = (
+            N - (self.window_size[0] * self.window_size[1])
+            if self.prompt_location == "prepend"
+            else 0
+        )
         qkv, _ = self.qkv(x)
         qkv = qkv.reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
@@ -849,28 +987,28 @@ class PromptedWindowAttention(WindowAttention):
         )
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
 
-        if self.prompt_location == "prepend":
+        if self.prompt_location == "prepend" and prompt_count > 0:
             _C, _H, _W = relative_position_bias.shape
             relative_position_bias = torch.cat(
-                (torch.zeros(_C, self.num_prompts, _W, device=attn.device), relative_position_bias), dim=1
+                (torch.zeros(_C, prompt_count, _W, device=attn.device), relative_position_bias), dim=1
             )
             relative_position_bias = torch.cat(
-                (torch.zeros(_C, _H + self.num_prompts, self.num_prompts, device=attn.device), relative_position_bias), dim=-1
+                (torch.zeros(_C, _H + prompt_count, prompt_count, device=attn.device), relative_position_bias), dim=-1
             )
 
         attn = attn + relative_position_bias.unsqueeze(0)
 
         if mask is not None:
             nW = mask.shape[0]
-            if self.prompt_location == "prepend":
+            if self.prompt_location == "prepend" and prompt_count > 0:
                 mask = torch.cat(
-                    (torch.zeros(nW, self.num_prompts, _W, device=attn.device), mask), dim=1
+                    (torch.zeros(nW, prompt_count, _W, device=attn.device), mask), dim=1
                 )
-            if self.prompt_location == "prepend":
+            if self.prompt_location == "prepend" and prompt_count > 0:
                 mask = torch.cat(
                     (
                         torch.zeros(
-                            nW, _H + self.num_prompts, self.num_prompts, device=attn.device
+                            nW, _H + prompt_count, prompt_count, device=attn.device
                         ),
                         mask,
                     ),
