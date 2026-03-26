@@ -324,6 +324,8 @@ _C.OUTPUT = ''
 _C.TAG = 'default'
 # Frequency to save checkpoint
 _C.SAVE_FREQ = 1
+# Frequency to run validation
+_C.EVAL_FREQ = 1
 # Frequency to logging info
 _C.PRINT_FREQ = 10
 # Fixed random seed
