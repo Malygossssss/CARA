@@ -415,7 +415,7 @@ def compute_ta_lora_replacement_deltas(config, model, data_loader, device, logge
                     task: float(task_losses[task](full_outputs[task], targets[task]).item())
                     for task in config.TASKS
                 }
-                base_keep_indices = clone_keep_indices(backbone.export_prompt_pruning())
+                active_keep_indices = clone_keep_indices(backbone.export_prompt_pruning())
                 task_lora_off_losses = {
                     task: {layer_idx: 0.0 for layer_idx in range(backbone.num_layers)}
                     for task in config.TASKS
@@ -431,24 +431,27 @@ def compute_ta_lora_replacement_deltas(config, model, data_loader, device, logge
 
                 for task in config.TASKS:
                     for layer_idx in range(backbone.num_layers):
-                        active_indices = list(base_keep_indices[task][layer_idx])
+                        active_indices = list(active_keep_indices[task][layer_idx])
                         if len(active_indices) <= 1:
                             continue
                         for token_idx in active_indices:
-                            dropped_keep_indices = clone_keep_indices(base_keep_indices)
-                            dropped_keep_indices[task][layer_idx] = [
-                                index for index in active_indices if index != token_idx
-                            ]
-                            if not dropped_keep_indices[task][layer_idx]:
-                                continue
-
-                            backbone.set_prompt_pruning(dropped_keep_indices)
+                            runtime_gates = backbone.build_prompt_runtime_gates(
+                                device=device, requires_grad=False
+                            )
+                            runtime_gates[task][layer_idx][token_idx] = 0.0
+                            backbone.set_prompt_runtime_gates(runtime_gates)
                             token_off_outputs = model(images)
                             token_off_loss = float(
                                 task_losses[task](token_off_outputs[task], targets[task]).item()
                             )
                             delta_on_sums[task][layer_idx][token_idx] += token_off_loss - full_losses[task]
+                            backbone.clear_prompt_runtime_gates()
 
+                            runtime_gates = backbone.build_prompt_runtime_gates(
+                                device=device, requires_grad=False
+                            )
+                            runtime_gates[task][layer_idx][token_idx] = 0.0
+                            backbone.set_prompt_runtime_gates(runtime_gates)
                             with backbone.disable_task_lora(layer_idx, task):
                                 token_and_lora_off_outputs = model(images)
                             token_and_lora_off_loss = float(
@@ -457,11 +460,12 @@ def compute_ta_lora_replacement_deltas(config, model, data_loader, device, logge
                             delta_off_sums[task][layer_idx][token_idx] += (
                                 token_and_lora_off_loss - task_lora_off_losses[task][layer_idx]
                             )
-                            backbone.set_prompt_pruning(base_keep_indices)
+                            backbone.clear_prompt_runtime_gates()
 
                 counts += 1
     finally:
         backbone.set_prompt_pruning(original_keep_indices)
+        backbone.clear_prompt_runtime_gates()
 
     if counts == 0:
         raise RuntimeError("Stage3 TA-LoRA replacement computation did not process any batches.")
