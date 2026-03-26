@@ -201,6 +201,7 @@ class MTLoRALinear(LoRALayer):
         self.shared_mode = shared_mode
         self.r_shared = int(r.get('shared', 0))
         self.r_tasks = {task: int(r.get(task, 0)) for task in (tasks or [])}
+        self.task_lora_enabled = {task: True for task in self.r_tasks.keys()}
         self.has_shared_lora = self.r_shared > 0
         self.has_task_lora = has_tasks and any(rank > 0 for rank in self.r_tasks.values())
         self.has_lora = self.has_shared_lora or self.has_task_lora
@@ -268,6 +269,13 @@ class MTLoRALinear(LoRALayer):
     def set_shared_lora_enabled(self, enabled: bool) -> None:
         self.shared_lora_enabled = bool(enabled)
 
+    def set_task_lora_enabled(self, task: str, enabled: bool) -> None:
+        if task in self.task_lora_enabled:
+            self.task_lora_enabled[task] = bool(enabled)
+
+    def get_task_lora_enabled(self, task: str) -> bool:
+        return bool(self.task_lora_enabled.get(task, True))
+
     def forward(self, x: torch.Tensor, x_tasks: Dict[str, torch.Tensor] = None):
         # TODO: handle merging
         pretrained = self.linear(x)
@@ -279,11 +287,18 @@ class MTLoRALinear(LoRALayer):
         lora_tasks = None
 
         if self.has_task_lora:
-            lora_tasks = {
-                task: pretrained + ((x if x_tasks is None else x_tasks[task]) @ self.lora_tasks_A[task].transpose(
-                    0, 1) @ self.lora_tasks_B[task].transpose(0, 1) * self.lora_task_scale[task])
-                for task in self.lora_tasks_A.keys()
-            }
+            lora_tasks = {}
+            for task in self.lora_tasks_A.keys():
+                if not self.get_task_lora_enabled(task):
+                    lora_tasks[task] = pretrained
+                    continue
+                task_input = x if x_tasks is None else x_tasks[task]
+                lora_tasks[task] = pretrained + (
+                    task_input
+                    @ self.lora_tasks_A[task].transpose(0, 1)
+                    @ self.lora_tasks_B[task].transpose(0, 1)
+                    * self.lora_task_scale[task]
+                )
 
         if self.has_shared_lora and self.shared_lora_enabled:
             if self.shared_mode == 'matrix':
@@ -335,6 +350,7 @@ class MTLoRAQKV(LoRALayer):
                               tasks=tasks, trainable_scale_shared=trainable_scale_shared, trainable_scale_per_task=trainable_scale_per_task, shared_mode=shared_mode, layer_idx=layer_idx, **kwargs)
         self.v = MTLoRALinear(in_features, out_features, r=r, lora_shared_scale=lora_shared_scale, lora_task_scale=lora_task_scale, lora_dropout=lora_dropout,
                               tasks=tasks, trainable_scale_shared=trainable_scale_shared, trainable_scale_per_task=trainable_scale_per_task, shared_mode=shared_mode, layer_idx=layer_idx, **kwargs)
+        self.has_task_lora = any(getattr(module, "has_task_lora", False) for module in (self.q, self.k, self.v))
         self.has_shared_lora = any(getattr(module, "has_shared_lora", False) for module in (self.q, self.k, self.v))
         self.shared_lora_enabled = True
 
@@ -351,6 +367,18 @@ class MTLoRAQKV(LoRALayer):
         self.q.set_shared_lora_enabled(enabled)
         self.k.set_shared_lora_enabled(enabled)
         self.v.set_shared_lora_enabled(enabled)
+
+    def set_task_lora_enabled(self, task: str, enabled: bool) -> None:
+        self.q.set_task_lora_enabled(task, enabled)
+        self.k.set_task_lora_enabled(task, enabled)
+        self.v.set_task_lora_enabled(task, enabled)
+
+    def get_task_lora_enabled(self, task: str) -> bool:
+        return (
+            self.q.get_task_lora_enabled(task)
+            and self.k.get_task_lora_enabled(task)
+            and self.v.get_task_lora_enabled(task)
+        )
 
     def forward(self, x: torch.Tensor, x_tasks: Dict[str, torch.Tensor] = None):
         return (torch.cat([self.q(x, x_tasks)[0], self.k(x, x_tasks)[0], self.v(x, x_tasks)[0]], dim=-1),

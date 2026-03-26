@@ -825,6 +825,11 @@ class SwinTransformerMTLoRA(nn.Module):
             if hasattr(module, "set_shared_lora_enabled"):
                 module.set_shared_lora_enabled(enabled)
 
+    def set_task_lora_enabled(self, layer_idx, task, enabled: bool) -> None:
+        for module in self.iter_mtlora_modules(layer_idx=layer_idx):
+            if hasattr(module, "set_task_lora_enabled"):
+                module.set_task_lora_enabled(task, enabled)
+
     @contextmanager
     def disable_shared_lora(self, layer_idx):
         affected = []
@@ -838,6 +843,22 @@ class SwinTransformerMTLoRA(nn.Module):
         finally:
             for module, enabled in affected:
                 module.set_shared_lora_enabled(enabled)
+
+    @contextmanager
+    def disable_task_lora(self, layer_idx, task):
+        affected = []
+        for module in self.iter_mtlora_modules(layer_idx=layer_idx):
+            if not getattr(module, "has_task_lora", False):
+                continue
+            if not hasattr(module, "get_task_lora_enabled") or not hasattr(module, "set_task_lora_enabled"):
+                continue
+            affected.append((module, module.get_task_lora_enabled(task)))
+            module.set_task_lora_enabled(task, False)
+        try:
+            yield
+        finally:
+            for module, enabled in affected:
+                module.set_task_lora_enabled(task, enabled)
 
     def forward_features(self, x, return_stages=False, flatten_ft=False):
         x = self.patch_embed(x)

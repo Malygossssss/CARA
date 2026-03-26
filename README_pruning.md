@@ -59,15 +59,18 @@ Stage 2:
 
 Stage 3:
 
-- computes `S_GA = S_base * clamp_min(DeltaL_P, 0) / (clamp_min(DeltaL_GA, 0) + eps)`
+- computes `S_final = S_base * exp(-beta * relu(tilde_Delta_off - tilde_Delta_on))`
 - keeps the same pruning and recovery recipe as stage 2
 - changes only the importance score
 
 Where:
 
 - `S_base(t,l,k) = |dL_t / dm[t,l,k]|`
-- `DeltaL_P(t,l,k) = L_t(drop only token k at layer l) - L_t(full)`
-- `DeltaL_GA(t,l) = L_t(drop GA-LoRA at layer l) - L_t(full)`
+- `Delta_on(t,l,k) = L01(t,l,k) - L11(t,l,k)`
+- `Delta_off(t,l,k) = L00(t,l,k) - L10(t,l)`
+- `tilde_Delta_on/off` are stage-wise normalized positive deltas
+- `R(t,l,k) = relu(tilde_Delta_off(t,l,k) - tilde_Delta_on(t,l,k))`
+- `beta` and `eps` are controlled by `PRUNING.IMPORTANCE.STAGE3_IMPORTANCE_BETA` and `PRUNING.IMPORTANCE.STAGE3_IMPORTANCE_EPS`
 
 ## Output Layout
 

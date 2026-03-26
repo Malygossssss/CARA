@@ -390,6 +390,101 @@ def compute_base_importance(config, model, data_loader, device, logger):
     return base_scores
 
 
+def compute_ta_lora_replacement_deltas(config, model, data_loader, device, logger):
+    backbone = ensure_prompt_backbone(model)
+    if not hasattr(backbone, "disable_task_lora"):
+        raise RuntimeError("Stage3 TA-LoRA replacement scoring requires backbone.disable_task_lora(...).")
+
+    num_batches = int(config.PRUNING.IMPORTANCE.NUM_BATCHES)
+    task_losses = build_multitask_criterion(config).loss_ft
+    delta_on_sums = init_score_dict(backbone, config.TASKS)
+    delta_off_sums = init_score_dict(backbone, config.TASKS)
+    counts = 0
+    original_keep_indices = clone_keep_indices(backbone.export_prompt_pruning())
+
+    model.eval()
+    try:
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(data_loader):
+                if batch_idx >= num_batches:
+                    break
+
+                images, targets = batch_to_device(batch, config.TASKS, device)
+                full_outputs = model(images)
+                full_losses = {
+                    task: float(task_losses[task](full_outputs[task], targets[task]).item())
+                    for task in config.TASKS
+                }
+                base_keep_indices = clone_keep_indices(backbone.export_prompt_pruning())
+                task_lora_off_losses = {
+                    task: {layer_idx: 0.0 for layer_idx in range(backbone.num_layers)}
+                    for task in config.TASKS
+                }
+
+                for task in config.TASKS:
+                    for layer_idx in range(backbone.num_layers):
+                        with backbone.disable_task_lora(layer_idx, task):
+                            lora_off_outputs = model(images)
+                        task_lora_off_losses[task][layer_idx] = float(
+                            task_losses[task](lora_off_outputs[task], targets[task]).item()
+                        )
+
+                for task in config.TASKS:
+                    for layer_idx in range(backbone.num_layers):
+                        active_indices = list(base_keep_indices[task][layer_idx])
+                        if len(active_indices) <= 1:
+                            continue
+                        for token_idx in active_indices:
+                            dropped_keep_indices = clone_keep_indices(base_keep_indices)
+                            dropped_keep_indices[task][layer_idx] = [
+                                index for index in active_indices if index != token_idx
+                            ]
+                            if not dropped_keep_indices[task][layer_idx]:
+                                continue
+
+                            backbone.set_prompt_pruning(dropped_keep_indices)
+                            token_off_outputs = model(images)
+                            token_off_loss = float(
+                                task_losses[task](token_off_outputs[task], targets[task]).item()
+                            )
+                            delta_on_sums[task][layer_idx][token_idx] += token_off_loss - full_losses[task]
+
+                            with backbone.disable_task_lora(layer_idx, task):
+                                token_and_lora_off_outputs = model(images)
+                            token_and_lora_off_loss = float(
+                                task_losses[task](token_and_lora_off_outputs[task], targets[task]).item()
+                            )
+                            delta_off_sums[task][layer_idx][token_idx] += (
+                                token_and_lora_off_loss - task_lora_off_losses[task][layer_idx]
+                            )
+                            backbone.set_prompt_pruning(base_keep_indices)
+
+                counts += 1
+    finally:
+        backbone.set_prompt_pruning(original_keep_indices)
+
+    if counts == 0:
+        raise RuntimeError("Stage3 TA-LoRA replacement computation did not process any batches.")
+
+    logger.info("Computed stage3 TA-LoRA replacement deltas on %d batches.", counts)
+    return (
+        {
+            task: {
+                layer_idx: (delta_on_sums[task][layer_idx] / counts).float()
+                for layer_idx in range(backbone.num_layers)
+            }
+            for task in config.TASKS
+        },
+        {
+            task: {
+                layer_idx: (delta_off_sums[task][layer_idx] / counts).float()
+                for layer_idx in range(backbone.num_layers)
+            }
+            for task in config.TASKS
+        },
+    )
+
+
 def compute_ga_delta_losses(config, model, data_loader, device, logger):
     backbone = ensure_prompt_backbone(model)
     num_batches = int(config.PRUNING.IMPORTANCE.NUM_BATCHES)
@@ -501,18 +596,112 @@ def build_ga_scores(base_scores, ga_delta_losses, token_delta_losses, eps):
     return ga_scores
 
 
+def normalize_stage_delta(delta_tensor, eps):
+    delta_pos = torch.clamp_min(delta_tensor.float(), 0.0)
+    stage_mean = float(delta_pos.mean().item())
+    if stage_mean <= 0.0:
+        return delta_pos, torch.zeros_like(delta_pos)
+    return delta_pos, delta_pos / (stage_mean + eps)
+
+
+def build_ta_replacement_scores(base_scores, delta_on_losses, delta_off_losses, beta, eps, logger=None):
+    final_scores = {}
+    delta_on_pos = {}
+    delta_off_pos = {}
+    replacement_scores = {}
+    stage_summaries = []
+
+    for task, layer_map in base_scores.items():
+        final_scores[task] = {}
+        delta_on_pos[task] = {}
+        delta_off_pos[task] = {}
+        replacement_scores[task] = {}
+        for layer_idx, scores in layer_map.items():
+            on_pos, on_norm = normalize_stage_delta(delta_on_losses[task][layer_idx], eps)
+            off_pos, off_norm = normalize_stage_delta(delta_off_losses[task][layer_idx], eps)
+            replacement = torch.relu(off_norm - on_norm)
+            final = scores.float() * torch.exp(-beta * replacement)
+
+            delta_on_pos[task][layer_idx] = on_pos
+            delta_off_pos[task][layer_idx] = off_pos
+            replacement_scores[task][layer_idx] = replacement
+            final_scores[task][layer_idx] = final
+
+            summary = {
+                "task": task,
+                "layer": layer_idx,
+                "mean_base_score": float(scores.float().mean().item()),
+                "mean_delta_on_pos": float(on_pos.mean().item()),
+                "mean_delta_off_pos": float(off_pos.mean().item()),
+                "mean_replacement": float(replacement.mean().item()),
+                "mean_final_score": float(final.mean().item()),
+            }
+            stage_summaries.append(summary)
+            if logger is not None:
+                logger.info(
+                    "Stage3 TA replacement [%s][L%d]: base=%.6f on=%.6f off=%.6f R=%.6f final=%.6f",
+                    task,
+                    layer_idx,
+                    summary["mean_base_score"],
+                    summary["mean_delta_on_pos"],
+                    summary["mean_delta_off_pos"],
+                    summary["mean_replacement"],
+                    summary["mean_final_score"],
+                )
+
+    return {
+        "ga_scores": final_scores,
+        "ta_delta_on_losses": delta_on_losses,
+        "ta_delta_off_losses": delta_off_losses,
+        "ta_delta_on_pos": delta_on_pos,
+        "ta_delta_off_pos": delta_off_pos,
+        "ta_replacement_scores": replacement_scores,
+        "stage3_ta_summary": stage_summaries,
+    }
+
+
 def scores_to_records(score_payload):
     records = []
     base_scores = score_payload["base_scores"]
     ga_scores = score_payload.get("ga_scores")
     ga_delta_losses = score_payload.get("ga_delta_losses", {})
     token_delta_losses = score_payload.get("token_delta_losses", {})
+    ta_delta_on_losses = score_payload.get("ta_delta_on_losses", {})
+    ta_delta_off_losses = score_payload.get("ta_delta_off_losses", {})
+    ta_delta_on_pos = score_payload.get("ta_delta_on_pos", {})
+    ta_delta_off_pos = score_payload.get("ta_delta_off_pos", {})
+    ta_replacement_scores = score_payload.get("ta_replacement_scores", {})
     for task, layer_map in base_scores.items():
         for layer_idx, base_tensor in layer_map.items():
             ga_tensor = ga_scores[task][layer_idx] if ga_scores is not None else None
             token_delta_tensor = (
                 token_delta_losses[task][layer_idx]
                 if token_delta_losses is not None and task in token_delta_losses and layer_idx in token_delta_losses[task]
+                else None
+            )
+            ta_delta_on_tensor = (
+                ta_delta_on_losses[task][layer_idx]
+                if ta_delta_on_losses is not None and task in ta_delta_on_losses and layer_idx in ta_delta_on_losses[task]
+                else None
+            )
+            ta_delta_off_tensor = (
+                ta_delta_off_losses[task][layer_idx]
+                if ta_delta_off_losses is not None and task in ta_delta_off_losses and layer_idx in ta_delta_off_losses[task]
+                else None
+            )
+            ta_delta_on_pos_tensor = (
+                ta_delta_on_pos[task][layer_idx]
+                if ta_delta_on_pos is not None and task in ta_delta_on_pos and layer_idx in ta_delta_on_pos[task]
+                else None
+            )
+            ta_delta_off_pos_tensor = (
+                ta_delta_off_pos[task][layer_idx]
+                if ta_delta_off_pos is not None and task in ta_delta_off_pos and layer_idx in ta_delta_off_pos[task]
+                else None
+            )
+            ta_replacement_tensor = (
+                ta_replacement_scores[task][layer_idx]
+                if ta_replacement_scores is not None and task in ta_replacement_scores and layer_idx in ta_replacement_scores[task]
                 else None
             )
             for token_idx, base_score in enumerate(base_tensor.tolist()):
@@ -524,9 +713,20 @@ def scores_to_records(score_payload):
                 }
                 if ga_tensor is not None:
                     record["ga_score"] = float(ga_tensor[token_idx].item())
-                    record["ga_delta_loss"] = float(ga_delta_losses[task][layer_idx])
+                    if ga_delta_losses and task in ga_delta_losses and layer_idx in ga_delta_losses[task]:
+                        record["ga_delta_loss"] = float(ga_delta_losses[task][layer_idx])
                 if token_delta_tensor is not None:
                     record["token_delta_loss"] = float(token_delta_tensor[token_idx].item())
+                if ta_delta_on_tensor is not None:
+                    record["ta_delta_on_loss"] = float(ta_delta_on_tensor[token_idx].item())
+                if ta_delta_off_tensor is not None:
+                    record["ta_delta_off_loss"] = float(ta_delta_off_tensor[token_idx].item())
+                if ta_delta_on_pos_tensor is not None:
+                    record["ta_delta_on_pos"] = float(ta_delta_on_pos_tensor[token_idx].item())
+                if ta_delta_off_pos_tensor is not None:
+                    record["ta_delta_off_pos"] = float(ta_delta_off_pos_tensor[token_idx].item())
+                if ta_replacement_tensor is not None:
+                    record["ta_replacement"] = float(ta_replacement_tensor[token_idx].item())
                 records.append(record)
     return records
 
@@ -548,7 +748,16 @@ def load_importance_scores(path):
 
 def tensorize_score_payload(score_payload):
     converted = dict(score_payload)
-    for key in ("base_scores", "ga_scores", "token_delta_losses"):
+    for key in (
+        "base_scores",
+        "ga_scores",
+        "token_delta_losses",
+        "ta_delta_on_losses",
+        "ta_delta_off_losses",
+        "ta_delta_on_pos",
+        "ta_delta_off_pos",
+        "ta_replacement_scores",
+    ):
         if key not in converted or converted[key] is None:
             continue
         converted[key] = {
@@ -574,15 +783,28 @@ def resolve_importance_payload(config, model, loader, device, logger, output_dir
         logger.info("Loading importance scores from %s", load_path)
         payload = tensorize_score_payload(load_importance_scores(load_path))
         if str(config.PRUNING.IMPORTANCE.TYPE).lower() == "ga":
-            required_fields = ("ga_delta_losses", "token_delta_losses", "ga_scores")
+            if bool(config.PRUNING.IMPORTANCE.STAGE3_IMPORTANCE_USE_TA_REPLACEMENT):
+                required_fields = (
+                    "ta_delta_on_losses",
+                    "ta_delta_off_losses",
+                    "ta_replacement_scores",
+                    "ga_scores",
+                )
+            else:
+                required_fields = ("ga_delta_losses", "token_delta_losses", "ga_scores")
             missing_fields = [
                 field for field in required_fields if field not in payload or payload[field] in (None, {})
             ]
             if missing_fields:
+                detail = (
+                    "current TA-LoRA replacement-aware implementation"
+                    if bool(config.PRUNING.IMPORTANCE.STAGE3_IMPORTANCE_USE_TA_REPLACEMENT)
+                    else "current implementation"
+                )
                 raise RuntimeError(
                     "Loaded stage3 importance file is missing "
                     + ", ".join(missing_fields)
-                    + ". Recompute stage3 importance with the current token-specific GA-aware implementation."
+                    + f". Recompute stage3 importance with the {detail}."
                 )
         return payload
 
@@ -592,17 +814,32 @@ def resolve_importance_payload(config, model, loader, device, logger, output_dir
         "base_scores": base_scores,
     }
     if str(config.PRUNING.IMPORTANCE.TYPE).lower() == "ga":
-        ga_delta_losses = compute_ga_delta_losses(config, model, loader, device, logger)
-        token_delta_losses = compute_token_delta_losses(config, model, loader, device, logger)
-        ga_scores = build_ga_scores(
-            base_scores,
-            ga_delta_losses,
-            token_delta_losses,
-            float(config.PRUNING.IMPORTANCE.GA_EPS),
-        )
-        payload["ga_delta_losses"] = ga_delta_losses
-        payload["token_delta_losses"] = token_delta_losses
-        payload["ga_scores"] = ga_scores
+        if bool(config.PRUNING.IMPORTANCE.STAGE3_IMPORTANCE_USE_TA_REPLACEMENT):
+            delta_on_losses, delta_off_losses = compute_ta_lora_replacement_deltas(
+                config, model, loader, device, logger
+            )
+            payload.update(
+                build_ta_replacement_scores(
+                    base_scores,
+                    delta_on_losses,
+                    delta_off_losses,
+                    float(config.PRUNING.IMPORTANCE.STAGE3_IMPORTANCE_BETA),
+                    float(config.PRUNING.IMPORTANCE.STAGE3_IMPORTANCE_EPS),
+                    logger=logger,
+                )
+            )
+        else:
+            ga_delta_losses = compute_ga_delta_losses(config, model, loader, device, logger)
+            token_delta_losses = compute_token_delta_losses(config, model, loader, device, logger)
+            ga_scores = build_ga_scores(
+                base_scores,
+                ga_delta_losses,
+                token_delta_losses,
+                float(config.PRUNING.IMPORTANCE.GA_EPS),
+            )
+            payload["ga_delta_losses"] = ga_delta_losses
+            payload["token_delta_losses"] = token_delta_losses
+            payload["ga_scores"] = ga_scores
     save_importance_scores(output_dir, payload)
     return tensorize_score_payload(payload)
 
