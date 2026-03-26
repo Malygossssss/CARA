@@ -29,6 +29,12 @@ Stage 1 first:
 2. `configs/mtlora/tiny_448/pascal/unipora_prune_stage1_base_p10.yaml`
 3. `configs/mtlora/tiny_448/pascal/unipora_prune_stage1_base_p15.yaml`
 
+For a direct no-recovery comparison between base importance and the stage-3 TA-replacement-aware importance, run:
+
+1. `configs/mtlora/tiny_448/pascal/unipora_prune_stage1_tarepl_p5.yaml`
+2. `configs/mtlora/tiny_448/pascal/unipora_prune_stage1_tarepl_p10.yaml`
+3. `configs/mtlora/tiny_448/pascal/unipora_prune_stage1_tarepl_p15.yaml`
+
 If stage 1 shows that around 10% pruning is stable, run stage 2:
 
 1. `configs/mtlora/tiny_448/pascal/unipora_prune_stage2_base_recover_p10.yaml`
@@ -62,6 +68,9 @@ Stage 3:
 - computes `S_final = S_base * exp(-beta * relu(tilde_Delta_off - tilde_Delta_on))`
 - keeps the same pruning and recovery recipe as stage 2
 - changes only the importance score
+
+Stage 1 TA-replacement comparison configs reuse the same `S_final` score as stage 3, but disable recovery so that
+the score itself can be compared directly against the base stage-1 runs.
 
 Where:
 
