@@ -109,6 +109,35 @@ The `aggregate` section includes:
 - `overall_keep_ratio`
 - `overall_prune_ratio`
 
+## Task-Wise Mixed Pruning
+
+You can now mix pruning ratios across tasks in a single run with:
+
+- `PRUNING.PRUNER.RATIO`
+- `PRUNING.PRUNER.TASK_RATIOS`
+
+If `TASK_RATIOS` is provided, each listed task uses its own ratio and any task not listed falls back to the
+global `RATIO`. Setting a task ratio to `0.0` keeps that task unpruned.
+
+Selective recovery is also supported with:
+
+- `PRUNING.RECOVERY.PROMPT_TASKS`
+- `PRUNING.RECOVERY.HEAD_TASKS`
+- `PRUNING.RECOVERY.LOSS_TASKS`
+- `PRUNING.RECOVERY.DISTILL_TASKS`
+
+Empty lists preserve the old behavior and default to all tasks. If you provide a subset, only those tasks
+participate in the corresponding recovery component.
+
+Selective prompt recovery is implemented against task-specific prompt parameters. If the backbone is using
+dynamic prompts, the current code requires selecting all tasks together and will raise an explicit error for
+partial prompt-task subsets.
+
+Example mixed-task configs:
+
+- `configs/mtlora/tiny_448/pascal/unipora_prune_taskmix_base_maskonly_sem30_sal20_human15_norm0.yaml`
+- `configs/mtlora/tiny_448/pascal/unipora_prune_taskmix_base_selective_recover_sem30_sal20_human15_norm0.yaml`
+
 ## Reuse Modes
 
 The YAML flags support partial reruns:

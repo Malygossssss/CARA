@@ -342,6 +342,100 @@ def clone_keep_indices(keep_indices):
     }
 
 
+def resolve_task_prune_ratios(config):
+    default_ratio = float(config.PRUNING.PRUNER.RATIO)
+    task_ratio_cfg = getattr(config.PRUNING.PRUNER, "TASK_RATIOS", {})
+    ratio_overrides = {str(task): float(value) for task, value in task_ratio_cfg.items()}
+    unknown_tasks = sorted(set(ratio_overrides.keys()) - set(config.TASKS))
+    if unknown_tasks:
+        raise RuntimeError(f"Unknown tasks in PRUNING.PRUNER.TASK_RATIOS: {unknown_tasks}")
+
+    task_ratios = {}
+    for task in config.TASKS:
+        ratio = ratio_overrides.get(task, default_ratio)
+        if ratio < 0.0 or ratio > 1.0:
+            raise RuntimeError(f"Invalid prune ratio {ratio} for task {task}. Expected [0, 1].")
+        task_ratios[task] = ratio
+    return task_ratios
+
+
+def resolve_recovery_task_selection(config):
+    all_tasks = list(config.TASKS)
+
+    def normalize(task_list, label, default_tasks):
+        selected = list(default_tasks) if len(task_list) == 0 else [str(task) for task in task_list]
+        unknown_tasks = sorted(set(selected) - set(all_tasks))
+        if unknown_tasks:
+            raise RuntimeError(f"Unknown tasks in PRUNING.RECOVERY.{label}: {unknown_tasks}")
+        return selected
+
+    prompt_tasks = normalize(
+        list(config.PRUNING.RECOVERY.PROMPT_TASKS),
+        "PROMPT_TASKS",
+        all_tasks if config.PRUNING.RECOVERY.TRAIN_TA_PROMPT else [],
+    )
+    head_tasks = normalize(
+        list(config.PRUNING.RECOVERY.HEAD_TASKS),
+        "HEAD_TASKS",
+        all_tasks if config.PRUNING.RECOVERY.TRAIN_TASK_HEADS else [],
+    )
+    loss_tasks = normalize(
+        list(config.PRUNING.RECOVERY.LOSS_TASKS),
+        "LOSS_TASKS",
+        all_tasks,
+    )
+    distill_default = loss_tasks
+    distill_tasks = normalize(
+        list(config.PRUNING.RECOVERY.DISTILL_TASKS),
+        "DISTILL_TASKS",
+        distill_default,
+    )
+    return {
+        "prompt_tasks": prompt_tasks,
+        "head_tasks": head_tasks,
+        "loss_tasks": loss_tasks,
+        "distill_tasks": distill_tasks,
+    }
+
+
+def set_prompt_task_trainable(backbone, task, requires_grad):
+    touched = False
+    for attr_name in ("prompt_embeddings", "prompt_embeddings_tb", "prompt_embeddings_lr"):
+        prompt_dict = getattr(backbone, attr_name, None)
+        if prompt_dict is not None and task in prompt_dict:
+            prompt_dict[task].requires_grad = requires_grad
+            touched = True
+
+    deep_prompt_embeddings = getattr(backbone, "deep_prompt_embeddings", None)
+    if deep_prompt_embeddings is not None:
+        for prompt_dict in deep_prompt_embeddings:
+            if task in prompt_dict:
+                prompt_dict[task].requires_grad = requires_grad
+                touched = True
+    return touched
+
+
+def set_task_head_trainable(model, task, requires_grad):
+    decoder_group = getattr(model, "decoders", None)
+    task_decoders = getattr(decoder_group, "decoders", None)
+    if task_decoders is None or task not in task_decoders:
+        return False
+    for parameter in task_decoders[task].parameters():
+        parameter.requires_grad = requires_grad
+    return True
+
+
+def compute_selected_task_loss(criterion, outputs, targets, tasks, device):
+    if len(tasks) == 0:
+        return torch.tensor(0.0, device=device), {}
+
+    task_loss_map = {task: criterion.loss_ft[task](outputs[task], targets[task]) for task in tasks}
+    total_loss = torch.sum(
+        torch.stack([criterion.loss_weights[task] * task_loss_map[task] for task in tasks])
+    )
+    return total_loss, task_loss_map
+
+
 def compute_base_importance(config, model, data_loader, device, logger):
     backbone = ensure_prompt_backbone(model)
     num_batches = int(config.PRUNING.IMPORTANCE.NUM_BATCHES)
@@ -853,6 +947,7 @@ def generate_pruning_mask(config, score_payload, model):
     score_type = str(config.PRUNING.IMPORTANCE.TYPE).lower()
     active_scores = score_payload["base_scores"] if score_type == "base" else score_payload["ga_scores"]
     ratio = float(config.PRUNING.PRUNER.RATIO)
+    task_ratios = resolve_task_prune_ratios(config)
     min_tokens = int(config.PRUNING.PRUNER.MIN_TOKENS_PER_LAYER)
     keep_indices = {}
     summary = []
@@ -862,7 +957,8 @@ def generate_pruning_mask(config, score_payload, model):
         for layer_idx in range(backbone.num_layers):
             layer_scores = active_scores[task][layer_idx].float()
             num_tokens = int(layer_scores.numel())
-            prune_count = int(math.floor(num_tokens * ratio))
+            task_ratio = float(task_ratios[task])
+            prune_count = int(math.floor(num_tokens * task_ratio))
             prune_count = min(prune_count, max(num_tokens - min_tokens, 0))
             sorted_indices = torch.argsort(layer_scores, dim=0)
             keep_mask = torch.ones(num_tokens, dtype=torch.bool)
@@ -875,7 +971,7 @@ def generate_pruning_mask(config, score_payload, model):
                     "task": task,
                     "layer": layer_idx,
                     "score_type": score_type,
-                    "prune_ratio": ratio,
+                    "prune_ratio": task_ratio,
                     "original_tokens": num_tokens,
                     "pruned_tokens": prune_count,
                     "kept_tokens": int(kept.numel()),
@@ -894,6 +990,7 @@ def generate_pruning_mask(config, score_payload, model):
     return {
         "score_type": score_type,
         "prune_ratio": ratio,
+        "task_prune_ratios": task_ratios,
         "min_tokens_per_layer": min_tokens,
         "keep_indices": {
             task: {layer_idx: indices.tolist() for layer_idx, indices in layer_map.items()}
@@ -941,18 +1038,22 @@ def maybe_build_teacher(config, device, logger):
 
 def configure_recovery_trainability(config, model, logger):
     backbone = ensure_prompt_backbone(model)
+    recovery_tasks = resolve_recovery_task_selection(config)
+
     for parameter in model.parameters():
         parameter.requires_grad = False
 
     if config.PRUNING.RECOVERY.TRAIN_TASK_HEADS:
-        for name, parameter in model.named_parameters():
-            if not name.startswith("backbone."):
-                parameter.requires_grad = True
+        for task in recovery_tasks["head_tasks"]:
+            set_task_head_trainable(model, task, True)
 
     if config.PRUNING.RECOVERY.TRAIN_TA_PROMPT:
-        for name, parameter in backbone.named_parameters():
-            if any(token in name for token in PROMPT_PARAM_NAMES):
-                parameter.requires_grad = True
+        if getattr(backbone, "use_dynamic_prompts", False) and set(recovery_tasks["prompt_tasks"]) != set(config.TASKS):
+            raise RuntimeError(
+                "Task-wise selective prompt recovery is not supported when dynamic prompts are enabled."
+            )
+        for task in recovery_tasks["prompt_tasks"]:
+            set_prompt_task_trainable(backbone, task, True)
 
     if not config.PRUNING.RECOVERY.FREEZE_BACKBONE:
         for name, parameter in backbone.named_parameters():
@@ -982,7 +1083,17 @@ def configure_recovery_trainability(config, model, logger):
                 parameter.requires_grad = True
 
     trainable_names = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
+    if len(trainable_names) == 0:
+        raise RuntimeError("Recovery has no trainable tensors after applying task-wise trainability settings.")
+    logger.info(
+        "Recovery task selection: prompt=%s head=%s loss=%s distill=%s",
+        recovery_tasks["prompt_tasks"],
+        recovery_tasks["head_tasks"],
+        recovery_tasks["loss_tasks"],
+        recovery_tasks["distill_tasks"],
+    )
     logger.info("Recovery trainable tensors: %d", len(trainable_names))
+    return recovery_tasks
 
 
 def compute_logit_distillation_loss(student_outputs, teacher_outputs, tasks):
@@ -1010,7 +1121,7 @@ def run_recovery_training(config, model, teacher, train_loader, val_loader, devi
     recovery_config.TRAIN.EPOCHS = int(config.PRUNING.RECOVERY.EPOCHS)
     recovery_config.freeze()
 
-    configure_recovery_trainability(config, model, logger)
+    recovery_tasks = configure_recovery_trainability(config, model, logger)
     optimizer = build_optimizer(recovery_config, model)
     lr_scheduler = build_scheduler(recovery_config, optimizer, len(train_loader))
     criterion = build_multitask_criterion(config)
@@ -1025,25 +1136,35 @@ def run_recovery_training(config, model, teacher, train_loader, val_loader, devi
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=use_amp):
                 student_outputs = model(images)
-                task_loss, _ = criterion(student_outputs, targets)
+                task_loss, _ = compute_selected_task_loss(
+                    criterion, student_outputs, targets, recovery_tasks["loss_tasks"], device
+                )
                 total_loss = task_loss
                 logit_distill_loss = torch.tensor(0.0, device=device)
                 feature_distill_loss = torch.tensor(0.0, device=device)
 
-                if teacher is not None and config.PRUNING.DISTILL.LOGIT_WEIGHT > 0.0:
+                if (
+                    teacher is not None
+                    and config.PRUNING.DISTILL.LOGIT_WEIGHT > 0.0
+                    and len(recovery_tasks["distill_tasks"]) > 0
+                ):
                     with torch.no_grad():
                         teacher_outputs = teacher(images)
                     logit_distill_loss = compute_logit_distillation_loss(
-                        student_outputs, teacher_outputs, config.TASKS
+                        student_outputs, teacher_outputs, recovery_tasks["distill_tasks"]
                     )
                     total_loss = total_loss + config.PRUNING.DISTILL.LOGIT_WEIGHT * logit_distill_loss
 
-                if teacher is not None and config.PRUNING.DISTILL.FEATURE_WEIGHT > 0.0:
+                if (
+                    teacher is not None
+                    and config.PRUNING.DISTILL.FEATURE_WEIGHT > 0.0
+                    and len(recovery_tasks["distill_tasks"]) > 0
+                ):
                     with torch.no_grad():
-                        teacher_features = extract_backbone_features(teacher, images, config.TASKS)
-                    student_features = extract_backbone_features(model, images, config.TASKS)
+                        teacher_features = extract_backbone_features(teacher, images, recovery_tasks["distill_tasks"])
+                    student_features = extract_backbone_features(model, images, recovery_tasks["distill_tasks"])
                     feature_distill_loss = compute_feature_distillation_loss(
-                        student_features, teacher_features, config.TASKS
+                        student_features, teacher_features, recovery_tasks["distill_tasks"]
                     )
                     total_loss = total_loss + config.PRUNING.DISTILL.FEATURE_WEIGHT * feature_distill_loss
 
@@ -1171,6 +1292,11 @@ def run_pruning_experiment(config, args):
         logger.info("Saved recovery checkpoint to %s", recovery_checkpoint)
 
     final_prompt_stats = collect_prompt_statistics(model, config.TASKS)
+    recovery_selection = (
+        resolve_recovery_task_selection(config)
+        if config.PRUNING.RUN_RECOVERY
+        else {"prompt_tasks": [], "head_tasks": [], "loss_tasks": [], "distill_tasks": []}
+    )
     experiment_summary = {
         "experiment_name": config.PRUNING.EXPERIMENT_NAME or Path(args.cfg).stem,
         "importance_type": config.PRUNING.IMPORTANCE.TYPE,
@@ -1178,6 +1304,11 @@ def run_pruning_experiment(config, args):
         "apply_pruning": bool(config.PRUNING.APPLY_PRUNING or config.PRUNING.PRUNER.LOAD_MASK),
         "run_recovery": bool(config.PRUNING.RUN_RECOVERY),
         "prune_ratio": float(config.PRUNING.PRUNER.RATIO),
+        "task_prune_ratios": resolve_task_prune_ratios(config),
+        "recovery_prompt_tasks": recovery_selection["prompt_tasks"],
+        "recovery_head_tasks": recovery_selection["head_tasks"],
+        "recovery_loss_tasks": recovery_selection["loss_tasks"],
+        "recovery_distill_tasks": recovery_selection["distill_tasks"],
         "prompt_statistics_before": prompt_stats_before,
         "prompt_statistics_after": final_prompt_stats,
         "eval_before_recovery": eval_before_recovery,
