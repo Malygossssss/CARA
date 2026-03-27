@@ -913,3 +913,33 @@ def get_mtl_val_dataloader(config, dataset):
     testloader = DataLoader(dataset, batch_size=config.DATA.BATCH_SIZE, shuffle=False, drop_last=False,
                             num_workers=config.DATA.NUM_WORKERS, pin_memory=config.DATA.PIN_MEMORY)
     return testloader
+
+
+def get_mtl_eval_dataset(db_name, config, transforms, split='val'):
+    """Return an evaluation dataset for the requested split."""
+
+    split = str(split)
+    if split not in {'val', 'test'}:
+        raise ValueError(f"Unsupported eval split: {split}")
+
+    print(f'Preparing {split} loader for db: {db_name}')
+
+    if db_name == 'NYUD':
+        database = NYUD_MT(root=config.DATA.DATA_PATH, split=split, transform=transforms,
+                           do_edge='edge' in config.TASKS,
+                           do_semseg='semseg' in config.TASKS,
+                           do_normals='normals' in config.TASKS,
+                           do_depth='depth' in config.TASKS, overfit=False)
+    elif db_name == 'PASCALContext':
+        database = PASCALContext(root=config.DATA.DATA_PATH, split=[split], transform=transforms, retname=True,
+                                 do_semseg='semseg' in config.TASKS,
+                                 do_edge='edge' in config.TASKS,
+                                 do_normals='normals' in config.TASKS,
+                                 do_sal='sal' in config.TASKS,
+                                 do_human_parts='human_parts' in config.TASKS,
+                                 overfit=False)
+    else:
+        raise NotImplemented(
+            "test_db_name: Choose among PASCALContext and NYUD")
+
+    return database

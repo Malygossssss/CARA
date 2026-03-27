@@ -18,7 +18,14 @@ from timm.data import create_transform
 from .cached_image_folder import CachedImageFolder
 from .imagenet22k_dataset import IN22KDATASET
 from .samplers import SubsetRandomSampler
-from data.mtl_ds import get_mtl_train_dataset, get_mtl_train_dataloader, get_mtl_val_dataset, get_mtl_val_dataloader, get_transformations
+from data.mtl_ds import (
+    get_mtl_eval_dataset,
+    get_mtl_train_dataset,
+    get_mtl_train_dataloader,
+    get_mtl_val_dataset,
+    get_mtl_val_dataloader,
+    get_transformations,
+)
 import re
 
 
@@ -222,3 +229,11 @@ def build_nyud(config):
 
 def build_pascal(config, val_only):
     return build_mtl(config, 'PASCALContext', val_only=val_only)
+
+
+def build_mtl_eval_loader(config, split='val'):
+    db_name = config.DATA.DBNAME
+    _, eval_transforms = get_transformations(db_name, config.TASKS_CONFIG)
+    dataset_eval = get_mtl_eval_dataset(db_name, config, eval_transforms, split=split)
+    data_loader_eval = get_mtl_val_dataloader(config, dataset_eval)
+    return dataset_eval, data_loader_eval

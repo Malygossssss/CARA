@@ -1,4 +1,4 @@
-from .build import build_loader as _build_loader, build_nyud, build_pascal
+from .build import build_loader as _build_loader, build_mtl_eval_loader, build_nyud, build_pascal
 from .data_simmim_pt import build_loader_simmim
 from .data_simmim_ft import build_loader_finetune
 
@@ -14,3 +14,9 @@ def build_loader(config, simmim=False, is_pretrain=False, val_only=False):
         return build_loader_simmim(config)
     else:
         return build_loader_finetune(config)
+
+
+__all__ = [
+    "build_loader",
+    "build_mtl_eval_loader",
+]

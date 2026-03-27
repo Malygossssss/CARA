@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 
+from data import build_mtl_eval_loader
 from data.mtl_ds import collate_mil, get_mtl_train_dataset, get_transformations
 from logger import create_logger
 from .experiment import (
@@ -443,6 +444,11 @@ def run_greedy_pruning_experiment(config, args):
         config, search_val_loader, model, device, logger, output_dir, "final_search_val"
     )
     save_json(os.path.join(output_dir, "final_search_val_metrics.json"), final_metrics)
+    _, test_loader = build_mtl_eval_loader(config, split="test")
+    final_test_metrics = evaluate_model(
+        config, test_loader, model, device, logger, output_dir, "final_test"
+    )
+    save_json(os.path.join(output_dir, "final_test_metrics.json"), final_test_metrics)
     final_prompt_statistics = collect_prompt_statistics(model, config.TASKS)
     save_json(os.path.join(output_dir, "final_prompt_statistics.json"), final_prompt_statistics)
 
@@ -463,6 +469,7 @@ def run_greedy_pruning_experiment(config, args):
         "accepted_trials": int(accepted_counter),
         "initial_search_val_metrics": initial_metrics,
         "final_search_val_metrics": final_metrics,
+        "final_test_metrics": final_test_metrics,
     }
     save_json(os.path.join(output_dir, "greedy_summary.json"), summary)
     return {"output_dir": output_dir, "summary": summary}

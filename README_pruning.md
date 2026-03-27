@@ -85,6 +85,7 @@ Greedy post-training pruning:
 - applies step sizes `10% -> 5% -> 2% -> 1 token`
 - never runs recovery or fine-tuning
 - supports both `base` and `ga` importance
+- uses `search-val` only for greedy decisions, then runs one final `test` evaluation after the mask is fixed
 
 Where:
 
@@ -124,8 +125,20 @@ Greedy runs additionally write:
 - `final_pruning_mask.json`
 - `final_pruned_checkpoint.pth`
 - `final_search_val_metrics.json`
+- `final_test_metrics.json`
 - `final_prompt_statistics.json`
 - `importance_snapshots/`
+
+If you want to re-evaluate a saved pruned checkpoint later, use the dedicated standalone evaluator:
+
+```bash
+python run_unipora_pruned_eval.py \
+  --cfg configs/mtlora/tiny_448/pascal/unipora_greedy_base.yaml \
+  --pascal PASCAL_MT \
+  --tasks semseg,normals,sal,human_parts \
+  --batch-size 12 \
+  --checkpoint /path/to/final_pruned_checkpoint.pth
+```
 
 `pruning_summary.json` now stores the full pruning payload, including:
 
