@@ -35,6 +35,11 @@ For a direct no-recovery comparison between base importance and the stage-3 TA-r
 2. `configs/mtlora/tiny_448/pascal/unipora_prune_stage1_tarepl_p10.yaml`
 3. `configs/mtlora/tiny_448/pascal/unipora_prune_stage1_tarepl_p15.yaml`
 
+For post-training task-aware greedy pruning on a fixed search-val split from train, run:
+
+1. `configs/mtlora/tiny_448/pascal/unipora_greedy_base.yaml`
+2. `configs/mtlora/tiny_448/pascal/unipora_greedy_ga.yaml`
+
 If stage 1 shows that around 10% pruning is stable, run stage 2:
 
 1. `configs/mtlora/tiny_448/pascal/unipora_prune_stage2_base_recover_p10.yaml`
@@ -72,6 +77,15 @@ Stage 3:
 Stage 1 TA-replacement comparison configs reuse the same `S_final` score as stage 3, but disable recovery so that
 the score itself can be compared directly against the base stage-1 runs.
 
+Greedy post-training pruning:
+
+- uses a fixed `search-val` split carved from train only
+- evaluates accept/reject on the current task only
+- searches task by task, then layer by layer
+- applies step sizes `10% -> 5% -> 2% -> 1 token`
+- never runs recovery or fine-tuning
+- supports both `base` and `ga` importance
+
 Where:
 
 - `S_base(t,l,k) = |dL_t / dm[t,l,k]|`
@@ -99,6 +113,19 @@ The directory contains:
 - `recovery_checkpoint.pth`
 - `eval_after_recovery.json`
 - `experiment_summary.json`
+
+Greedy runs additionally write:
+
+- `search_val_split.json`
+- `initial_search_val_metrics.json`
+- `greedy_trials.jsonl`
+- `greedy_summary.json`
+- `final_pruning_mask.pth`
+- `final_pruning_mask.json`
+- `final_pruned_checkpoint.pth`
+- `final_search_val_metrics.json`
+- `final_prompt_statistics.json`
+- `importance_snapshots/`
 
 `pruning_summary.json` now stores the full pruning payload, including:
 
@@ -146,6 +173,30 @@ Example mixed-task configs:
 
 - `configs/mtlora/tiny_448/pascal/unipora_prune_taskmix_base_maskonly_sem30_sal20_human15_norm0.yaml`
 - `configs/mtlora/tiny_448/pascal/unipora_prune_taskmix_base_selective_recover_sem30_sal20_human15_norm0.yaml`
+
+## Greedy Commands
+
+Base importance:
+
+```bash
+python run_unipora_greedy_pruning.py \
+  --cfg configs/mtlora/tiny_448/pascal/unipora_greedy_base.yaml \
+  --pascal PASCAL_MT \
+  --tasks semseg,normals,sal,human_parts \
+  --batch-size 12 \
+  --resume /path/to/unipora_teacher_checkpoint.pth
+```
+
+TA-replacement-aware GA importance:
+
+```bash
+python run_unipora_greedy_pruning.py \
+  --cfg configs/mtlora/tiny_448/pascal/unipora_greedy_ga.yaml \
+  --pascal PASCAL_MT \
+  --tasks semseg,normals,sal,human_parts \
+  --batch-size 12 \
+  --resume /path/to/unipora_teacher_checkpoint.pth
+```
 
 ## Reuse Modes
 

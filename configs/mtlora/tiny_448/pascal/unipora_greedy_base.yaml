@@ -1,0 +1,21 @@
+BASE: ['promlora_tiny_448_r64_prom60_scale4_pertask.yaml']
+TAG: unipora_ta_prompt_pruning
+SEED: 0
+DETERMINISTIC: True
+PRUNING:
+  ENABLED: True
+  EXPERIMENT_NAME: unipora_greedy_base
+  IMPORTANCE:
+    TYPE: base
+    NUM_BATCHES: 8
+    STAGE3_IMPORTANCE_USE_TA_REPLACEMENT: True
+    STAGE3_IMPORTANCE_BETA: 1.0
+    STAGE3_IMPORTANCE_EPS: 1.0e-8
+  GREEDY:
+    ENABLED: True
+    SEARCH_VAL_RATIO: 0.10
+    MIN_TOKENS_PER_LAYER: 1
+    STEP_SCHEDULE: [0.10, 0.05, 0.02]
+    FINAL_TOKEN_STEP: 1
+    IMPORTANCE_SOURCE: train_remainder
+    SAVE_IMPORTANCE_SNAPSHOTS: True
