@@ -690,15 +690,25 @@ class PromptedBasicLayer(nn.Module):
                         if tasks_lora is not None:
                             x = tasks_lora[task]
                     else:
+                        current_prompt_count = (
+                            x.shape[1] - (self.input_resolution[0] * self.input_resolution[1])
+                            if self.prompt_location == "prepend"
+                            else 0
+                        )
                         prompt_emb = deep_prompt_embd[i - 1].expand(B, -1, -1)
-                        x = torch.cat((prompt_emb, x[:, prompt_count:, :]), dim=1)
+                        x = torch.cat((prompt_emb, x[:, current_prompt_count:, :]), dim=1)
                         x, tasks_lora = self.blocks[i](x)
                         if tasks_lora is not None:
                             x = tasks_lora[task]
             else:
                 for i in range(num_blocks):
+                    current_prompt_count = (
+                        x.shape[1] - (self.input_resolution[0] * self.input_resolution[1])
+                        if self.prompt_location == "prepend"
+                        else 0
+                    )
                     prompt_emb = deep_prompt_embd[i].expand(B, -1, -1)
-                    x = torch.cat((prompt_emb, x[:, prompt_count:, :]), dim=1)
+                    x = torch.cat((prompt_emb, x[:, current_prompt_count:, :]), dim=1)
                     x, tasks_lora = self.blocks[i](x)
                     if tasks_lora is not None:
                         x = tasks_lora[task]
