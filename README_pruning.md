@@ -85,7 +85,7 @@ Greedy post-training pruning:
 - applies step sizes `10% -> 5% -> 2% -> 1 token`
 - never runs recovery or fine-tuning
 - supports both `base` and `ga` importance
-- uses `search-val` only for greedy decisions, then runs one final `test` evaluation after the mask is fixed
+- uses `search-val` only for greedy decisions, then runs one final evaluation on the normal training-time `val` split after the mask is fixed
 
 Where:
 
@@ -126,6 +126,7 @@ Greedy runs additionally write:
 - `final_pruned_checkpoint.pth`
 - `final_search_val_metrics.json`
 - `final_test_metrics.json`
+- `final_val_metrics.json`
 - `final_prompt_statistics.json`
 - `importance_snapshots/`
 
@@ -139,6 +140,8 @@ python run_unipora_pruned_eval.py \
   --batch-size 12 \
   --checkpoint /path/to/final_pruned_checkpoint.pth
 ```
+
+This standalone evaluator defaults to `--split val`, which matches the repository's normal validation logic.
 
 `pruning_summary.json` now stores the full pruning payload, including:
 

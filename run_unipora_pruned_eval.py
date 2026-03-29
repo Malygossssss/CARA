@@ -20,7 +20,7 @@ def parse_option():
     parser = argparse.ArgumentParser("UniPoRA pruned-checkpoint evaluation", add_help=False)
     parser.add_argument("--cfg", type=str, required=True, metavar="FILE", help="path to config file")
     parser.add_argument("--checkpoint", "--resume", dest="checkpoint", required=True, help="checkpoint to evaluate")
-    parser.add_argument("--split", type=str, default="test", choices=["val", "test"], help="evaluation split")
+    parser.add_argument("--split", type=str, default="val", choices=["val", "test"], help="evaluation split")
     parser.add_argument("--opts", default=None, nargs="+", help="Modify config options by adding KEY VALUE pairs.")
     parser.add_argument("--batch-size", type=int, help="batch size")
     parser.add_argument("--data-path", type=str, help="dataset path")

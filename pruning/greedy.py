@@ -264,6 +264,9 @@ def run_greedy_pruning_experiment(config, args):
         raise RuntimeError("Greedy prompt pruning currently supports PRUNING.GREEDY.IMPORTANCE_SOURCE=train_remainder only.")
     if len(config.PRUNING.GREEDY.STEP_SCHEDULE) != 3:
         raise RuntimeError("PRUNING.GREEDY.STEP_SCHEDULE must contain exactly three percentage steps.")
+    final_eval_split = str(config.PRUNING.GREEDY.FINAL_EVAL_SPLIT).lower()
+    if final_eval_split not in {"val", "test"}:
+        raise RuntimeError("PRUNING.GREEDY.FINAL_EVAL_SPLIT must be 'val' or 'test'.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     set_random_seed(config.SEED, config.DETERMINISTIC)
@@ -276,6 +279,7 @@ def run_greedy_pruning_experiment(config, args):
 
     logger.info("Running greedy prompt pruning in %s", output_dir)
     logger.info("Device: %s", device)
+    logger.info("Greedy final evaluation split: %s", final_eval_split)
 
     split_payload, search_val_loader, train_remainder_loader = build_search_loaders(config, output_dir)
     model = build_model_for_experiment(config, device)
@@ -444,11 +448,13 @@ def run_greedy_pruning_experiment(config, args):
         config, search_val_loader, model, device, logger, output_dir, "final_search_val"
     )
     save_json(os.path.join(output_dir, "final_search_val_metrics.json"), final_metrics)
-    _, test_loader = build_mtl_eval_loader(config, split="test")
-    final_test_metrics = evaluate_model(
-        config, test_loader, model, device, logger, output_dir, "final_test"
+    _, final_eval_loader = build_mtl_eval_loader(config, split=final_eval_split)
+    final_eval_metrics = evaluate_model(
+        config, final_eval_loader, model, device, logger, output_dir, f"final_{final_eval_split}"
     )
-    save_json(os.path.join(output_dir, "final_test_metrics.json"), final_test_metrics)
+    save_json(os.path.join(output_dir, f"final_{final_eval_split}_metrics.json"), final_eval_metrics)
+    if final_eval_split == "val":
+        save_json(os.path.join(output_dir, "final_test_metrics.json"), final_eval_metrics)
     final_prompt_statistics = collect_prompt_statistics(model, config.TASKS)
     save_json(os.path.join(output_dir, "final_prompt_statistics.json"), final_prompt_statistics)
 
@@ -469,7 +475,9 @@ def run_greedy_pruning_experiment(config, args):
         "accepted_trials": int(accepted_counter),
         "initial_search_val_metrics": initial_metrics,
         "final_search_val_metrics": final_metrics,
-        "final_test_metrics": final_test_metrics,
+        "final_eval_split": final_eval_split,
+        "final_eval_metrics": final_eval_metrics,
+        "final_test_metrics": final_eval_metrics if final_eval_split == "val" else final_eval_metrics,
     }
     save_json(os.path.join(output_dir, "greedy_summary.json"), summary)
     return {"output_dir": output_dir, "summary": summary}
