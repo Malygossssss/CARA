@@ -7,20 +7,15 @@ import torch
 
 from config import get_config
 from data import build_mtl_eval_loader
+from experiment_utils import build_model_for_experiment, load_model_state, save_json, set_random_seed
 from logger import create_logger
-from pruning.experiment import (
-    build_model_for_experiment,
-    load_model_state,
-    save_json,
-    set_random_seed,
-)
 
 
 BYTES_PER_MB = 1024.0 * 1024.0
 
 
 def parse_option():
-    parser = argparse.ArgumentParser("UniPoRA inference benchmark", add_help=False)
+    parser = argparse.ArgumentParser("MTLoRA inference benchmark")
     parser.add_argument("--cfg", type=str, required=True, metavar="FILE", help="path to config file")
     parser.add_argument("--checkpoint", "--resume", dest="checkpoint", required=True, help="checkpoint to benchmark")
     parser.add_argument("--split", type=str, default="val", choices=["val", "test"], help="evaluation split")
@@ -49,7 +44,7 @@ def parse_option():
 
 def get_output_dir(args):
     if args.output_dir:
-        return args.output_dir
+        return os.path.abspath(args.output_dir)
     checkpoint_dir = os.path.dirname(os.path.abspath(args.checkpoint))
     return os.path.join(checkpoint_dir, f"standalone_benchmark_{args.split}")
 
@@ -213,7 +208,7 @@ def main():
     output_dir = get_output_dir(args)
     os.makedirs(output_dir, exist_ok=True)
     logger = create_logger(output_dir=output_dir, dist_rank=0, name="inference_benchmark")
-    with open(os.path.join(output_dir, "config.json"), "w", encoding="utf-8") as handle:
+    with open(os.path.join(output_dir, "config.yaml"), "w", encoding="utf-8") as handle:
         handle.write(config.dump())
 
     logger.info("Running inference benchmark on %s", args.split)

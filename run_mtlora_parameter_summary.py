@@ -5,20 +5,15 @@ import os
 import torch
 
 from config import get_config
+from experiment_utils import build_model_for_experiment, load_model_state, save_json, set_random_seed
 from logger import create_logger
-from pruning.experiment import (
-    build_model_for_experiment,
-    load_model_state,
-    save_json,
-    set_random_seed,
-)
 
 
 BYTES_PER_MB = 1024.0 * 1024.0
 
 
 def parse_option():
-    parser = argparse.ArgumentParser("UniPoRA parameter summary", add_help=False)
+    parser = argparse.ArgumentParser("MTLoRA parameter summary")
     parser.add_argument("--cfg", type=str, required=True, metavar="FILE", help="path to config file")
     parser.add_argument("--checkpoint", "--resume", dest="checkpoint", required=True, help="checkpoint to inspect")
     parser.add_argument("--opts", default=None, nargs="+", help="Modify config options by adding KEY VALUE pairs.")
@@ -144,57 +139,14 @@ def summarize_named_buffers(model):
     }
 
 
-def summarize_prompt_layout(model):
-    backbone = getattr(model, "backbone", None)
-    if backbone is None or not hasattr(backbone, "prompt_embeddings"):
-        return None
-
-    prompt_summary = {
-        "compact_prompt_layout_enabled": bool(getattr(backbone, "_compact_prompt_layout", False)),
-        "entry_prompt_tokens": {},
-        "deep_prompt_tokens": {},
-    }
-
-    prompt_embeddings = getattr(backbone, "prompt_embeddings", None)
-    if prompt_embeddings is not None:
-        for task, prompt_tensor in prompt_embeddings.items():
-            prompt_summary["entry_prompt_tokens"][task] = int(prompt_tensor.shape[1])
-
-    deep_prompt_embeddings = getattr(backbone, "deep_prompt_embeddings", None)
-    if deep_prompt_embeddings is not None:
-        for layer_idx, task_prompts in enumerate(deep_prompt_embeddings):
-            layer_summary = {}
-            for task, prompt_tensor in task_prompts.items():
-                layer_summary[task] = int(prompt_tensor.shape[1])
-            prompt_summary["deep_prompt_tokens"][str(layer_idx)] = layer_summary
-
-    if hasattr(backbone, "export_prompt_pruning"):
-        try:
-            pruning_state = backbone.export_prompt_pruning()
-        except Exception:
-            pruning_state = None
-        if pruning_state is not None:
-            prompt_summary["runtime_prompt_pruning"] = pruning_state
-
-    return prompt_summary
-
-
-def build_summary_payload(args, config, checkpoint_bundle, model, include_parameter_details=False):
+def build_summary_payload(args, config, model, include_parameter_details=False):
     payload = {
         "checkpoint": os.path.abspath(args.checkpoint),
         "model_name": config.MODEL.NAME,
         "tasks": list(config.TASKS),
-        "compact_prompt_checkpoint": bool(
-            isinstance(checkpoint_bundle, dict)
-            and isinstance(checkpoint_bundle.get("compact_prompt"), dict)
-            and checkpoint_bundle["compact_prompt"].get("enabled", False)
-        ),
     }
     payload.update(summarize_named_parameters(model, include_parameter_details=include_parameter_details))
     payload.update(summarize_named_buffers(model))
-    prompt_layout = summarize_prompt_layout(model)
-    if prompt_layout is not None:
-        payload["prompt_layout"] = prompt_layout
     return payload
 
 
@@ -224,12 +176,11 @@ if __name__ == "__main__":
 
     device = torch.device("cpu")
     model = build_model_for_experiment(config, device)
-    checkpoint_bundle = load_model_state(model, args.checkpoint, config, logger)
+    load_model_state(model, args.checkpoint, config, logger)
 
     payload = build_summary_payload(
         args,
         config,
-        checkpoint_bundle,
         model,
         include_parameter_details=bool(args.list_parameters),
     )

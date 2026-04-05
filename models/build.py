@@ -16,7 +16,6 @@
 
 from .swin_transformer_mtlora import SwinTransformerMTLoRA
 from .swin_transformer import SwinTransformer
-from .swin_transformer_vpt import PromptedSwinTransformer
 from .swin_mtl import MultiTaskSwin
 
 
@@ -36,29 +35,7 @@ def build_model(config, is_pretrain=False):
         layernorm = nn.LayerNorm
 
     if model_type == 'swin':
-        if config.MODEL.PROMPT.ENABLED:
-            model = PromptedSwinTransformer(prompt_config=config.MODEL.PROMPT,
-                                            tasks=config.TASKS,
-                                            mtlora=config.MODEL.MTLORA,
-                                            img_size=config.DATA.IMG_SIZE,
-                                            patch_size=config.MODEL.SWIN.PATCH_SIZE,
-                                            in_chans=config.MODEL.SWIN.IN_CHANS,
-                                            num_classes=config.MODEL.NUM_CLASSES,
-                                            embed_dim=config.MODEL.SWIN.EMBED_DIM,
-                                            depths=config.MODEL.SWIN.DEPTHS,
-                                            num_heads=config.MODEL.SWIN.NUM_HEADS,
-                                            window_size=config.MODEL.SWIN.WINDOW_SIZE,
-                                            mlp_ratio=config.MODEL.SWIN.MLP_RATIO,
-                                            qkv_bias=config.MODEL.SWIN.QKV_BIAS,
-                                            qk_scale=config.MODEL.SWIN.QK_SCALE,
-                                            drop_rate=config.MODEL.DROP_RATE,
-                                            attn_drop_rate=config.MODEL.ATTN_DROP_RATE if hasattr(config.MODEL, 'ATTN_DROP_RATE') else 0.0,
-                                            drop_path_rate=config.MODEL.DROP_PATH_RATE,
-                                            norm_layer=layernorm,
-                                            ape=config.MODEL.SWIN.APE,
-                                            patch_norm=config.MODEL.SWIN.PATCH_NORM,
-                                            use_checkpoint=config.TRAIN.USE_CHECKPOINT)
-        elif config.MODEL.MTLORA.ENABLED:
+        if config.MODEL.MTLORA.ENABLED:
             model = SwinTransformerMTLoRA(img_size=config.DATA.IMG_SIZE,
                                           patch_size=config.MODEL.SWIN.PATCH_SIZE,
                                           in_chans=config.MODEL.SWIN.IN_CHANS,

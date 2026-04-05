@@ -6,7 +6,7 @@ from unittest import mock
 import torch
 from yacs.config import CfgNode as CN
 
-import run_unipora_inference_benchmark as benchmark
+import run_mtlora_inference_benchmark as benchmark
 
 
 def build_config(batch_size=8):
@@ -49,7 +49,7 @@ class InferenceBenchmarkHelpersTest(unittest.TestCase):
         config = build_config(batch_size=8)
 
         with mock.patch(
-            "run_unipora_inference_benchmark.build_mtl_eval_loader",
+            "run_mtlora_inference_benchmark.build_mtl_eval_loader",
             return_value=("dataset", "loader"),
         ) as mocked_build:
             loader_config, loader = benchmark.build_eval_loader_for_batch_size(config, split="val", batch_size=1)
@@ -66,10 +66,10 @@ class InferenceBenchmarkHelpersTest(unittest.TestCase):
         logger = mock.Mock()
 
         with mock.patch(
-            "run_unipora_inference_benchmark.build_model_for_experiment",
+            "run_mtlora_inference_benchmark.build_model_for_experiment",
             return_value=fake_model,
         ) as mocked_build, mock.patch(
-            "run_unipora_inference_benchmark.load_model_state"
+            "run_mtlora_inference_benchmark.load_model_state"
         ) as mocked_load:
             result = benchmark.load_model_for_benchmark(build_config(), "checkpoint.pth", torch.device("cuda:0"), logger)
 

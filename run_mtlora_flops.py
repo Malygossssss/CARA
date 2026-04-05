@@ -6,13 +6,8 @@ import torch
 from ptflops import get_model_complexity_info
 
 from config import get_config
+from experiment_utils import build_model_for_experiment, load_model_state, save_json, set_random_seed
 from logger import create_logger
-from pruning.experiment import (
-    build_model_for_experiment,
-    load_model_state,
-    save_json,
-    set_random_seed,
-)
 
 
 MACS_PER_GMAC = 1e9
@@ -21,7 +16,7 @@ SUPPORTED_BACKENDS = ("aten",)
 
 
 def parse_option():
-    parser = argparse.ArgumentParser("UniPoRA FLOPs summary", add_help=False)
+    parser = argparse.ArgumentParser("MTLoRA FLOPs summary")
     parser.add_argument("--cfg", type=str, required=True, metavar="FILE", help="path to config file")
     parser.add_argument("--checkpoint", "--resume", dest="checkpoint", required=True, help="checkpoint to inspect")
     parser.add_argument("--opts", default=None, nargs="+", help="Modify config options by adding KEY VALUE pairs.")
@@ -89,15 +84,11 @@ def build_counting_warnings(config):
     warnings = [
         "This script reports theoretical MACs/GFLOPs from ptflops aten backend, not latency.",
         "ptflops aten backend mainly counts aten mm/matmul/addmm/bmm/convolution ops.",
-        "Ops such as softmax, layernorm, interpolate, cat, index_select, roll, zeros, mean and reshape-like memory ops may be omitted or only partially covered.",
+        "Ops such as softmax, layernorm, interpolate, cat, roll, zeros, mean and reshape-like memory ops may be omitted or only partially covered.",
     ]
     if config.MTL:
         warnings.append(
             "The counting scope is the full multitask inference forward, including backbone, downsampler and decoder heads; it is not limited to trainable parameters."
-        )
-    if getattr(config.MODEL.PROMPT, "ENABLED", False):
-        warnings.append(
-            "Prompt-enabled MultiTaskSwin runs the backbone once per task in the actual forward path; reported MACs are for that full repeated-backbone inference path."
         )
     if getattr(config.MODEL.MTLORA, "ENABLED", False):
         warnings.append(
@@ -128,7 +119,7 @@ def compute_flops_summary(model, input_shape, backend, print_per_layer_stat=Fals
     }
 
 
-def build_summary_payload(args, config, checkpoint_bundle, flops_summary):
+def build_summary_payload(args, config, flops_summary):
     return {
         "checkpoint": os.path.abspath(args.checkpoint),
         "profile_backend": args.backend,
@@ -139,13 +130,7 @@ def build_summary_payload(args, config, checkpoint_bundle, flops_summary):
         "img_size": list(flops_summary["input_shape"][1:]),
         "decoder_heads": get_decoder_head_summary(config),
         "mtl_enabled": bool(config.MTL),
-        "prompt_enabled": bool(getattr(config.MODEL.PROMPT, "ENABLED", False)),
         "mtlora_enabled": bool(getattr(config.MODEL.MTLORA, "ENABLED", False)),
-        "compact_prompt_checkpoint": bool(
-            isinstance(checkpoint_bundle, dict)
-            and isinstance(checkpoint_bundle.get("compact_prompt"), dict)
-            and checkpoint_bundle["compact_prompt"].get("enabled", False)
-        ),
         "input_shape": flops_summary["input_shape"],
         "macs": flops_summary["macs"],
         "gmacs": flops_summary["gmacs"],
@@ -171,7 +156,7 @@ if __name__ == "__main__":
 
     device = torch.device("cpu")
     model = build_model_for_experiment(config, device)
-    checkpoint_bundle = load_model_state(model, args.checkpoint, config, logger)
+    load_model_state(model, args.checkpoint, config, logger)
 
     input_h, input_w = normalize_image_size(config)
     flops_summary = compute_flops_summary(
@@ -181,7 +166,7 @@ if __name__ == "__main__":
         print_per_layer_stat=bool(args.print_per_layer_stat),
         verbose=bool(args.verbose),
     )
-    payload = build_summary_payload(args, config, checkpoint_bundle, flops_summary)
+    payload = build_summary_payload(args, config, flops_summary)
 
     save_json(os.path.join(output_dir, "flops_summary.json"), payload)
     print(json.dumps(payload, indent=2, ensure_ascii=False))

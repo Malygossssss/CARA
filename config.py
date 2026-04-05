@@ -173,20 +173,6 @@ _C.MODEL.DECODER_CHANNELS = [18, 36, 72, 144]
 
 _C.MODEL.SEGFORMER_CHANNELS = 256
 
-# Visual Prompt Tuning settings
-_C.MODEL.PROMPT = CN()
-_C.MODEL.PROMPT.ENABLED = False
-_C.MODEL.PROMPT.NUM_TOKENS = 0
-_C.MODEL.PROMPT.DEEP = False
-_C.MODEL.PROMPT.DROPOUT = 0.0
-_C.MODEL.PROMPT.LOCATION = 'prepend'
-_C.MODEL.PROMPT.PROJECT = -1
-_C.MODEL.PROMPT.INITIATION = 'random'
-_C.MODEL.PROMPT.DYNAMIC_PROMPT = False
-_C.MODEL.PROMPT.SHARE_TASK_PROMPT = False
-_C.MODEL.PROMPT.DEEP_PROMPT_POOL_SIZE = 0
-_C.MODEL.PROMPT.DEEP_PROMPT_POOL_SIZES = []
-
 # -----------------------------------------------------------------------------
 # Training settings
 # -----------------------------------------------------------------------------
@@ -209,11 +195,6 @@ _C.TRAIN.ACCUMULATION_STEPS = 1
 # Whether to use gradient checkpointing to save memory
 # could be overwritten by command line argument
 _C.TRAIN.USE_CHECKPOINT = False
-# Enable computing conflict gradient ratio (CR)
-_C.TRAIN.ENABLE_CONFLICT_RATIO = False
-# Number of batches between conflict ratio evaluations when enabled
-_C.TRAIN.CONFLICT_RATIO_PERIOD = 50
-
 # LR scheduler
 _C.TRAIN.LR_SCHEDULER = CN()
 _C.TRAIN.LR_SCHEDULER.NAME = 'cosine'
@@ -251,26 +232,6 @@ _C.TRAIN.LAYER_DECAY = 1.0
 _C.TRAIN.MOE = CN()
 # Only save model on master device
 _C.TRAIN.MOE.SAVE_MASTER = False
-
-# Constrained multi-task training
-_C.TRAIN.CONSTRAINED_MTL = CN()
-_C.TRAIN.CONSTRAINED_MTL.ENABLED = False
-_C.TRAIN.CONSTRAINED_MTL.PROTECTED_TASKS = []
-_C.TRAIN.CONSTRAINED_MTL.OBJECTIVE = 'avg_unconstrained'
-_C.TRAIN.CONSTRAINED_MTL.REF_MODE = 'warmup_loss'
-_C.TRAIN.CONSTRAINED_MTL.REF_EPOCH_START = 0
-_C.TRAIN.CONSTRAINED_MTL.REF_EPOCH_END = 0
-_C.TRAIN.CONSTRAINED_MTL.WARMUP_EPOCHS = 20
-_C.TRAIN.CONSTRAINED_MTL.USE_RELATIVE_LOSS = True
-_C.TRAIN.CONSTRAINED_MTL.EPS_RELAX = CN(new_allowed=True)
-_C.TRAIN.CONSTRAINED_MTL.REF_LOSSES = CN(new_allowed=True)
-_C.TRAIN.CONSTRAINED_MTL.DUAL_UPDATE_FREQ = 'epoch'
-_C.TRAIN.CONSTRAINED_MTL.DUAL_LR = 0.05
-_C.TRAIN.CONSTRAINED_MTL.DUAL_CLAMP_MAX = 10.0
-_C.TRAIN.CONSTRAINED_MTL.ALM_RHO = 1.0
-_C.TRAIN.CONSTRAINED_MTL.ALM_RHO_GROWTH = 1.5
-_C.TRAIN.CONSTRAINED_MTL.ALM_RHO_PATIENCE = 5
-_C.TRAIN.CONSTRAINED_MTL.VIOLATION_EMA = 0.9
 # -----------------------------------------------------------------------------
 # Augmentation settings
 # -----------------------------------------------------------------------------
@@ -368,66 +329,6 @@ _C.MODEL.MTLORA.PROJ_ENABLED = True
 _C.MODEL.MTLORA.FC1_ENABLED = True
 _C.MODEL.MTLORA.FC2_ENABLED = True
 _C.MODEL.MTLORA.DOWNSAMPLER_ENABLED = False
-
-# -----------------------------------------------------------------------------
-# Prompt pruning / recovery settings
-# -----------------------------------------------------------------------------
-_C.PRUNING = CN()
-_C.PRUNING.ENABLED = False
-_C.PRUNING.EXPERIMENT_NAME = ''
-_C.PRUNING.OUTPUT_SUBDIR = 'pruning'
-_C.PRUNING.COMPUTE_IMPORTANCE = False
-_C.PRUNING.APPLY_PRUNING = False
-_C.PRUNING.RUN_RECOVERY = False
-_C.PRUNING.EVALUATE_AFTER_PRUNING = True
-_C.PRUNING.EVALUATE_AFTER_RECOVERY = True
-
-_C.PRUNING.IMPORTANCE = CN()
-_C.PRUNING.IMPORTANCE.TYPE = 'base'  # base | ga
-_C.PRUNING.IMPORTANCE.SOURCE = 'val'  # val | train
-_C.PRUNING.IMPORTANCE.NUM_BATCHES = 8
-_C.PRUNING.IMPORTANCE.LOAD_PATH = ''
-_C.PRUNING.IMPORTANCE.GA_EPS = 1e-6
-_C.PRUNING.IMPORTANCE.STAGE3_IMPORTANCE_USE_TA_REPLACEMENT = True
-_C.PRUNING.IMPORTANCE.STAGE3_IMPORTANCE_BETA = 1.0
-_C.PRUNING.IMPORTANCE.STAGE3_IMPORTANCE_EPS = 1e-8
-
-_C.PRUNING.PRUNER = CN()
-_C.PRUNING.PRUNER.RATIO = 0.1
-_C.PRUNING.PRUNER.TASK_RATIOS = CN(new_allowed=True)
-_C.PRUNING.PRUNER.MIN_TOKENS_PER_LAYER = 1
-_C.PRUNING.PRUNER.LOAD_MASK = ''
-_C.PRUNING.PRUNER.LOAD_PRUNED_CHECKPOINT = ''
-
-_C.PRUNING.RECOVERY = CN()
-_C.PRUNING.RECOVERY.EPOCHS = 5
-_C.PRUNING.RECOVERY.TEACHER_CHECKPOINT = ''
-_C.PRUNING.RECOVERY.STUDENT_CHECKPOINT = ''
-_C.PRUNING.RECOVERY.FREEZE_BACKBONE = True
-_C.PRUNING.RECOVERY.FREEZE_GALORA = True
-_C.PRUNING.RECOVERY.TRAIN_TA_PROMPT = True
-_C.PRUNING.RECOVERY.TRAIN_TASK_HEADS = True
-_C.PRUNING.RECOVERY.PROMPT_TASKS = []
-_C.PRUNING.RECOVERY.HEAD_TASKS = []
-_C.PRUNING.RECOVERY.LOSS_TASKS = []
-_C.PRUNING.RECOVERY.DISTILL_TASKS = []
-_C.PRUNING.RECOVERY.UNFREEZE_GALORA_LAST_N = 0
-
-_C.PRUNING.DISTILL = CN()
-_C.PRUNING.DISTILL.LOGIT_WEIGHT = 0.0
-_C.PRUNING.DISTILL.FEATURE_WEIGHT = 0.0
-
-_C.PRUNING.GREEDY = CN()
-_C.PRUNING.GREEDY.ENABLED = False
-_C.PRUNING.GREEDY.SEARCH_VAL_RATIO = 0.10
-_C.PRUNING.GREEDY.MIN_TOKENS_PER_LAYER = 1
-_C.PRUNING.GREEDY.STEP_SCHEDULE = [0.10, 0.05, 0.02]
-_C.PRUNING.GREEDY.FINAL_TOKEN_STEP = 1
-_C.PRUNING.GREEDY.IMPORTANCE_SOURCE = 'train_remainder'
-_C.PRUNING.GREEDY.REUSE_IMPORTANCE_WITHIN_LAYER = False
-_C.PRUNING.GREEDY.SAVE_IMPORTANCE_SNAPSHOTS = True
-_C.PRUNING.GREEDY.FINAL_EVAL_SPLIT = 'val'
-
 
 def _update_config_from_file(config, cfg_file):
     config.defrost()
@@ -588,15 +489,6 @@ def update_config(config, args):
 
     # output folder
     config.OUTPUT = os.path.join(config.OUTPUT, config.MODEL.NAME, config.TAG)
-
-    constrained_cfg = config.TRAIN.CONSTRAINED_MTL
-    if isinstance(constrained_cfg.PROTECTED_TASKS, str):
-        constrained_cfg.PROTECTED_TASKS = re.compile(
-            r'\s*,\s*').split(constrained_cfg.PROTECTED_TASKS)
-    elif constrained_cfg.PROTECTED_TASKS is None:
-        constrained_cfg.PROTECTED_TASKS = []
-    else:
-        constrained_cfg.PROTECTED_TASKS = list(constrained_cfg.PROTECTED_TASKS)
 
     # Normalize MTLoRA config
     if config.MODEL.MTLORA.ENABLED:
