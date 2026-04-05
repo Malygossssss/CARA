@@ -2,6 +2,11 @@ import argparse
 import datetime
 import json
 import os
+import sys
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 from ag_mtlora.stage1 import create_stage1_logger, run_stage1_pipeline, set_random_seed
 from config import get_config
