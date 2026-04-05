@@ -21,6 +21,12 @@ from yacs.config import CfgNode as CN
 from data.mtl_ds import get_tasks_config
 import json
 
+from ag_mtlora.config_utils import (
+    load_grouping_json,
+    resolve_artifact_path,
+    resolve_group_shared_ranks,
+)
+
 _C = CN()
 
 # Base config files
@@ -329,6 +335,40 @@ _C.MODEL.MTLORA.PROJ_ENABLED = True
 _C.MODEL.MTLORA.FC1_ENABLED = True
 _C.MODEL.MTLORA.FC2_ENABLED = True
 _C.MODEL.MTLORA.DOWNSAMPLER_ENABLED = False
+_C.MODEL.MTLORA.AGMTLORA_ENABLED = False
+_C.MODEL.MTLORA.AGMTLORA_STAGE = 0
+_C.MODEL.MTLORA.AGMTLORA_GROUPS = []
+_C.MODEL.MTLORA.AGMTLORA_GROUP_NAMES = []
+_C.MODEL.MTLORA.AGMTLORA_GROUP_RANKS = []
+_C.MODEL.MTLORA.AGMTLORA_TASK_TO_GROUP = CN(new_allowed=True)
+
+_C.MODEL.AGMTLORA = CN()
+_C.MODEL.AGMTLORA.ENABLED = False
+_C.MODEL.AGMTLORA.STAGE = 1
+_C.MODEL.AGMTLORA.MAX_GROUPS = 2
+_C.MODEL.AGMTLORA.TOTAL_SHARED_RANK_BUDGET = 64
+_C.MODEL.AGMTLORA.GROUP_SHARED_RANKS = []
+_C.MODEL.AGMTLORA.GROUP_RANK_ALLOCATION = 'equal_split'
+_C.MODEL.AGMTLORA.GROUPING_SOURCE = 'search'  # search, fixed_json
+_C.MODEL.AGMTLORA.GROUPING_JSON = ''
+_C.MODEL.AGMTLORA.AFFINITY_COLLECT_EPOCHS = 5
+_C.MODEL.AGMTLORA.AFFINITY_SAVE_PATH = ''
+_C.MODEL.AGMTLORA.GROUPING_SAVE_PATH = ''
+_C.MODEL.AGMTLORA.SEARCH_OBJECTIVE = 'mean_final_predicted_gain'
+_C.MODEL.AGMTLORA.PREDICTOR_TRAIN_GROUP_BUDGET = 0
+_C.MODEL.AGMTLORA.PREDICTOR_TRAIN_GROUP_STRATEGY = 'all_singletons+all_pairs+random_higher_order'
+_C.MODEL.AGMTLORA.PREDICTOR_GROUP_TRAIN_EPOCHS = 5
+_C.MODEL.AGMTLORA.BASE_PREDICTOR = 'spline_ridge'
+_C.MODEL.AGMTLORA.BASE_PREDICTOR_KWARGS = CN(new_allowed=True)
+_C.MODEL.AGMTLORA.RESIDUAL_PREDICTOR = 'ridge'
+_C.MODEL.AGMTLORA.RESIDUAL_ALPHA = 1.0
+_C.MODEL.AGMTLORA.VISUALIZE_SYMMETRIC_AFFINITY = True
+_C.MODEL.AGMTLORA.RESOLVED_GROUPS = []
+_C.MODEL.AGMTLORA.RESOLVED_GROUP_NAMES = []
+_C.MODEL.AGMTLORA.RESOLVED_GROUP_SHARED_RANKS = []
+_C.MODEL.AGMTLORA.RESOLVED_GROUP_RANK_SOURCE = ''
+_C.MODEL.AGMTLORA.RESOLVED_NUM_GROUPS = 0
+_C.MODEL.AGMTLORA.RESOLVED_TASK_TO_GROUP = CN(new_allowed=True)
 
 def _update_config_from_file(config, cfg_file):
     config.defrost()
@@ -572,6 +612,81 @@ def update_config(config, args):
                 layer_task_scale[task] = config.MODEL.MTLORA.SCALE_PER_TASK[task][i]
             config.MODEL.MTLORA.R_PER_TASK_LIST.append(layer_task_r)
             config.MODEL.MTLORA.SCALE_PER_TASK_LIST.append(layer_task_scale)
+
+    config.MODEL.MTLORA.AGMTLORA_ENABLED = False
+    config.MODEL.MTLORA.AGMTLORA_STAGE = 0
+    config.MODEL.MTLORA.AGMTLORA_GROUPS = []
+    config.MODEL.MTLORA.AGMTLORA_GROUP_NAMES = []
+    config.MODEL.MTLORA.AGMTLORA_GROUP_RANKS = []
+    config.MODEL.MTLORA.AGMTLORA_TASK_TO_GROUP = CN(new_allowed=True)
+
+    if config.MODEL.AGMTLORA.ENABLED:
+        if not config.MODEL.MTLORA.ENABLED:
+            raise ValueError("AGMTLoRA requires MODEL.MTLORA.ENABLED=True.")
+        if int(config.MODEL.AGMTLORA.STAGE) != 1:
+            raise ValueError("Only AG-MTLoRA Stage-1 is currently supported.")
+
+        base_output_dir = config.OUTPUT
+        config.MODEL.AGMTLORA.AFFINITY_SAVE_PATH = resolve_artifact_path(
+            base_output_dir,
+            config.MODEL.AGMTLORA.AFFINITY_SAVE_PATH,
+            "ag_mtlora_stage1/affinity.json",
+        )
+        config.MODEL.AGMTLORA.GROUPING_SAVE_PATH = resolve_artifact_path(
+            base_output_dir,
+            config.MODEL.AGMTLORA.GROUPING_SAVE_PATH,
+            "ag_mtlora_stage1/grouping.json",
+        )
+        if config.MODEL.AGMTLORA.GROUPING_JSON:
+            config.MODEL.AGMTLORA.GROUPING_JSON = resolve_artifact_path(
+                base_output_dir,
+                config.MODEL.AGMTLORA.GROUPING_JSON,
+                config.MODEL.AGMTLORA.GROUPING_JSON,
+            )
+
+        grouping_payload = None
+        if str(config.MODEL.AGMTLORA.GROUPING_SOURCE) == 'fixed_json':
+            if not config.MODEL.AGMTLORA.GROUPING_JSON:
+                raise ValueError("MODEL.AGMTLORA.GROUPING_JSON is required when GROUPING_SOURCE=fixed_json.")
+            grouping_payload = load_grouping_json(
+                config.MODEL.AGMTLORA.GROUPING_JSON,
+                config.TASKS,
+            )
+            resolved_groups = grouping_payload["groups"]
+            resolved_task_to_group = grouping_payload["task_to_group"]
+            resolved_group_names = [f"group_{idx}" for idx in range(len(resolved_groups))]
+            manual_group_ranks = config.MODEL.AGMTLORA.GROUP_SHARED_RANKS
+            rank_source = ""
+            if (not manual_group_ranks) and grouping_payload.get("group_shared_ranks"):
+                manual_group_ranks = grouping_payload["group_shared_ranks"]
+                rank_source = "grouping_json"
+            resolved_group_ranks, rank_source = resolve_group_shared_ranks(
+                manual_group_ranks,
+                config.MODEL.AGMTLORA.TOTAL_SHARED_RANK_BUDGET,
+                len(resolved_groups),
+                len(config.MODEL.SWIN.DEPTHS),
+                config.MODEL.AGMTLORA.GROUP_RANK_ALLOCATION,
+            )
+            if manual_group_ranks and rank_source != "grouping_json":
+                rank_source = "manual"
+
+            config.MODEL.AGMTLORA.RESOLVED_GROUPS = resolved_groups
+            config.MODEL.AGMTLORA.RESOLVED_GROUP_NAMES = resolved_group_names
+            config.MODEL.AGMTLORA.RESOLVED_GROUP_SHARED_RANKS = resolved_group_ranks
+            config.MODEL.AGMTLORA.RESOLVED_GROUP_RANK_SOURCE = rank_source
+            config.MODEL.AGMTLORA.RESOLVED_NUM_GROUPS = len(resolved_groups)
+            config.MODEL.AGMTLORA.RESOLVED_TASK_TO_GROUP = CN(new_allowed=True)
+            for task, group_name in resolved_task_to_group.items():
+                config.MODEL.AGMTLORA.RESOLVED_TASK_TO_GROUP[task] = group_name
+
+            config.MODEL.MTLORA.AGMTLORA_ENABLED = True
+            config.MODEL.MTLORA.AGMTLORA_STAGE = int(config.MODEL.AGMTLORA.STAGE)
+            config.MODEL.MTLORA.AGMTLORA_GROUPS = resolved_groups
+            config.MODEL.MTLORA.AGMTLORA_GROUP_NAMES = resolved_group_names
+            config.MODEL.MTLORA.AGMTLORA_GROUP_RANKS = resolved_group_ranks
+            config.MODEL.MTLORA.AGMTLORA_TASK_TO_GROUP = CN(new_allowed=True)
+            for task, group_name in resolved_task_to_group.items():
+                config.MODEL.MTLORA.AGMTLORA_TASK_TO_GROUP[task] = group_name
     config.freeze()
 
 

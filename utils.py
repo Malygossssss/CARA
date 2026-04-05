@@ -38,6 +38,77 @@ def mkdir_if_missing(directory):
                 raise
 
 
+def _copy_rank_aligned_tensor(source_tensor, target_tensor):
+    copied = target_tensor.clone()
+    copied.zero_()
+    if source_tensor.ndim != target_tensor.ndim:
+        return copied
+
+    if source_tensor.ndim == 2:
+        rows = min(source_tensor.shape[0], target_tensor.shape[0])
+        cols = min(source_tensor.shape[1], target_tensor.shape[1])
+        copied[:rows, :cols] = source_tensor[:rows, :cols]
+        return copied
+
+    if source_tensor.ndim == 1:
+        dim = min(source_tensor.shape[0], target_tensor.shape[0])
+        copied[:dim] = source_tensor[:dim]
+        return copied
+
+    slices = tuple(slice(0, min(src_dim, tgt_dim)) for src_dim, tgt_dim in zip(source_tensor.shape, target_tensor.shape))
+    copied[slices] = source_tensor[slices]
+    return copied
+
+
+def _expand_agmtlora_shared_state(model_state, target_state, config):
+    if not config.MODEL.AGMTLORA.ENABLED:
+        return model_state
+    if not getattr(config.MODEL.AGMTLORA, "RESOLVED_GROUP_NAMES", []):
+        return model_state
+
+    expanded_state = dict(model_state)
+    grouped_targets = [key for key in target_state.keys() if ".lora_shared_A_groups." in key or ".lora_shared_B_groups." in key]
+    if len(grouped_targets) == 0:
+        return expanded_state
+
+    group_names = list(config.MODEL.AGMTLORA.RESOLVED_GROUP_NAMES)
+    keys_to_delete = []
+
+    for source_key, source_value in list(model_state.items()):
+        if source_key.endswith(".lora_shared_A"):
+            prefix = source_key[:-len(".lora_shared_A")]
+            for group_name in group_names:
+                target_key = f"{prefix}.lora_shared_A_groups.{group_name}"
+                if target_key in target_state and target_key not in expanded_state:
+                    expanded_state[target_key] = _copy_rank_aligned_tensor(
+                        source_value, target_state[target_key]
+                    )
+            keys_to_delete.append(source_key)
+        elif source_key.endswith(".lora_shared_B"):
+            prefix = source_key[:-len(".lora_shared_B")]
+            for group_name in group_names:
+                target_key = f"{prefix}.lora_shared_B_groups.{group_name}"
+                if target_key in target_state and target_key not in expanded_state:
+                    expanded_state[target_key] = _copy_rank_aligned_tensor(
+                        source_value, target_state[target_key]
+                    )
+            keys_to_delete.append(source_key)
+        elif source_key.endswith(".lora_shared_scale"):
+            prefix = source_key[:-len(".lora_shared_scale")]
+            for group_name in group_names:
+                target_key = f"{prefix}.lora_shared_scale.{group_name}"
+                if target_key in target_state and target_key not in expanded_state:
+                    expanded_state[target_key] = _copy_rank_aligned_tensor(
+                        source_value, target_state[target_key]
+                    )
+            keys_to_delete.append(source_key)
+
+    for key in keys_to_delete:
+        expanded_state.pop(key, None)
+
+    return expanded_state
+
+
 def load_checkpoint(config, model, optimizer, lr_scheduler, loss_scaler, logger, backbone=False, quiet=False, extra_state=None, load_info=None):
     resume_path = config.MODEL.RESUME if not backbone else config.MODEL.RESUME_BACKBONE
     logger.info(
@@ -147,6 +218,11 @@ def load_checkpoint(config, model, optimizer, lr_scheduler, loss_scaler, logger,
             print("No keys needs to be mapped for LoRA")
         model_state = map_old_state_dict_weights(
             model_state, mapping, "", config.MODEL.MTLORA.SPLIT_QKV)
+    model_state = _expand_agmtlora_shared_state(
+        model_state,
+        model.state_dict(),
+        config,
+    )
     incompatible = model.load_state_dict(model_state, strict=False)
     if isinstance(incompatible, tuple):
         missing, unexpected = incompatible

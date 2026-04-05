@@ -169,6 +169,7 @@ class MTLoRALinear(LoRALayer):
         lora_task_scale: float = 1.0,
         lora_dropout: float = 0.0,
         tasks=None,
+        task_to_group: Mapping[str, str] = None,
         trainable_scale_shared=False,
         trainable_scale_per_task=False,
         shared_mode: str = 'matrix',
@@ -189,8 +190,13 @@ class MTLoRALinear(LoRALayer):
         if isinstance(r, int):
             r = {'shared': r}
         r = dict(r)
+        task_set = set(tasks or [])
+        group_keys = [key for key in r.keys() if key not in task_set and key != 'shared']
+        base_rank = int(r.get('shared', 0))
+        if len(group_keys) > 0:
+            base_rank = max(base_rank, max(int(r[key]) for key in group_keys))
         super().__init__(
-            r=r.get('shared', 0), lora_alpha=lora_shared_scale, lora_dropout=lora_dropout)
+            r=base_rank, lora_alpha=lora_shared_scale, lora_dropout=lora_dropout)
 
         self.linear = torch.nn.Linear(
             in_features, out_features, **kwargs)
@@ -198,11 +204,17 @@ class MTLoRALinear(LoRALayer):
         self.shared_lora_enabled = True
 
         self.tasks = tasks
+        self.task_to_group = dict(task_to_group or {})
         self.shared_mode = shared_mode
         self.r_shared = int(r.get('shared', 0))
+        self.group_shared_ranks = {group: int(r[group]) for group in group_keys}
+        self.group_names = list(self.group_shared_ranks.keys())
+        self.ag_enabled = len(self.group_names) > 0
+        if self.ag_enabled and self.shared_mode == 'addition':
+            raise NotImplementedError("AG-MTLoRA does not support shared_mode='addition'.")
         self.r_tasks = {task: int(r.get(task, 0)) for task in (tasks or [])}
         self.task_lora_enabled = {task: True for task in self.r_tasks.keys()}
-        self.has_shared_lora = self.r_shared > 0
+        self.has_shared_lora = (self.r_shared > 0) or any(rank > 0 for rank in self.group_shared_ranks.values())
         self.has_task_lora = has_tasks and any(rank > 0 for rank in self.r_tasks.values())
         self.has_lora = self.has_shared_lora or self.has_task_lora
 
@@ -234,17 +246,41 @@ class MTLoRALinear(LoRALayer):
                 assert has_tasks
                 self.lora_norm = nn.LayerNorm(out_features)
             elif self.shared_mode == 'matrix' or self.shared_mode == 'matrixv2':
-                self.lora_shared_A = nn.Parameter(
-                    self.linear.weight.new_zeros((self.r_shared, in_features)))
-                self.lora_shared_B = nn.Parameter(
-                    self.linear.weight.new_zeros((out_features, self.r_shared)))
+                if self.ag_enabled:
+                    self.lora_shared_A_groups = nn.ParameterDict({
+                        group: nn.Parameter(
+                            self.linear.weight.new_zeros((self.group_shared_ranks[group], in_features))
+                        )
+                        for group in self.group_names if self.group_shared_ranks[group] > 0
+                    })
+                    self.lora_shared_B_groups = nn.ParameterDict({
+                        group: nn.Parameter(
+                            self.linear.weight.new_zeros((out_features, self.group_shared_ranks[group]))
+                        )
+                        for group in self.group_names if self.group_shared_ranks[group] > 0
+                    })
+                else:
+                    self.lora_shared_A = nn.Parameter(
+                        self.linear.weight.new_zeros((self.r_shared, in_features)))
+                    self.lora_shared_B = nn.Parameter(
+                        self.linear.weight.new_zeros((out_features, self.r_shared)))
             else:
                 raise NotImplementedError
-            if trainable_scale_shared:
+            if trainable_scale_shared and self.ag_enabled:
+                self.lora_shared_scale = nn.ParameterDict({
+                    group: nn.Parameter(torch.FloatTensor([lora_shared_scale]))
+                    for group in self.group_names if self.group_shared_ranks[group] > 0
+                })
+            elif trainable_scale_shared:
                 self.lora_shared_scale = nn.Parameter(
                     torch.FloatTensor([lora_shared_scale]))
             else:
-                self.lora_shared_scale = lora_shared_scale
+                if self.ag_enabled:
+                    self.lora_shared_scale = {
+                        group: lora_shared_scale for group in self.group_names
+                    }
+                else:
+                    self.lora_shared_scale = lora_shared_scale
 
         if self.has_shared_lora or self.has_task_lora:
             self.reset_parameters()
@@ -256,6 +292,10 @@ class MTLoRALinear(LoRALayer):
             # Wondering why 'a' is equal to math.sqrt(5)?: https://github.com/pytorch/pytorch/issues/15314
             nn.init.kaiming_uniform_(self.lora_shared_A, a=math.sqrt(5))
             nn.init.zeros_(self.lora_shared_B)
+        if hasattr(self, "lora_shared_A_groups"):
+            for group in self.lora_shared_A_groups.keys():
+                nn.init.kaiming_uniform_(self.lora_shared_A_groups[group], a=math.sqrt(5))
+                nn.init.zeros_(self.lora_shared_B_groups[group])
         if hasattr(self, "lora_tasks_A"):
             for task in self.lora_tasks_A.keys():
                 nn.init.kaiming_uniform_(
@@ -276,6 +316,34 @@ class MTLoRALinear(LoRALayer):
     def get_task_lora_enabled(self, task: str) -> bool:
         return bool(self.task_lora_enabled.get(task, True))
 
+    def _apply_task_lora(self, task: str, task_input: torch.Tensor) -> torch.Tensor:
+        if not hasattr(self, "lora_tasks_A") or task not in self.lora_tasks_A:
+            return 0.0
+        return (
+            task_input
+            @ self.lora_tasks_A[task].transpose(0, 1)
+            @ self.lora_tasks_B[task].transpose(0, 1)
+            * self.lora_task_scale[task]
+        )
+
+    def _get_group_scale(self, group_name: str):
+        if isinstance(self.lora_shared_scale, nn.ParameterDict):
+            return self.lora_shared_scale[group_name]
+        if isinstance(self.lora_shared_scale, Mapping):
+            return self.lora_shared_scale[group_name]
+        return self.lora_shared_scale
+
+    def _apply_group_shared_lora(self, group_name: str, task_input: torch.Tensor) -> torch.Tensor:
+        if not hasattr(self, "lora_shared_A_groups"):
+            return 0.0
+        if group_name not in self.lora_shared_A_groups:
+            return 0.0
+        return (
+            task_input
+            @ self.lora_shared_A_groups[group_name].transpose(0, 1)
+            @ self.lora_shared_B_groups[group_name].transpose(0, 1)
+        ) * self._get_group_scale(group_name)
+
     def forward(self, x: torch.Tensor, x_tasks: Dict[str, torch.Tensor] = None):
         # TODO: handle merging
         pretrained = self.linear(x)
@@ -283,6 +351,27 @@ class MTLoRALinear(LoRALayer):
             return pretrained, None
 
         x = self.lora_dropout(x)
+        if self.ag_enabled:
+            lora_tasks = {}
+            for task in (self.tasks or []):
+                task_input_raw = x if x_tasks is None else x_tasks[task]
+                task_input = self.lora_dropout(task_input_raw)
+                task_pretrained = pretrained if x_tasks is None else self.linear(task_input_raw)
+                task_output = task_pretrained
+
+                if self.has_shared_lora and self.shared_lora_enabled:
+                    task_output = task_output + self._apply_group_shared_lora(
+                        self.task_to_group[task], task_input
+                    )
+
+                if self.has_task_lora and task in self.lora_tasks_A:
+                    if self.get_task_lora_enabled(task):
+                        task_output = task_output + self._apply_task_lora(task, task_input)
+
+                lora_tasks[task] = task_output
+
+            return pretrained, lora_tasks
+
         lora = 0.0
         lora_tasks = None
 
@@ -293,12 +382,7 @@ class MTLoRALinear(LoRALayer):
                     lora_tasks[task] = pretrained
                     continue
                 task_input = x if x_tasks is None else x_tasks[task]
-                lora_tasks[task] = pretrained + (
-                    task_input
-                    @ self.lora_tasks_A[task].transpose(0, 1)
-                    @ self.lora_tasks_B[task].transpose(0, 1)
-                    * self.lora_task_scale[task]
-                )
+                lora_tasks[task] = pretrained + self._apply_task_lora(task, task_input)
 
         if self.has_shared_lora and self.shared_lora_enabled:
             if self.shared_mode == 'matrix':
@@ -333,6 +417,7 @@ class MTLoRAQKV(LoRALayer):
         lora_task_scale: float = 1.0,
         lora_dropout: float = 0.0,
         tasks=None,
+        task_to_group: Mapping[str, str] = None,
         trainable_scale_shared=False,
         trainable_scale_per_task=False,
         shared_mode: str = 'matrix',
@@ -345,11 +430,11 @@ class MTLoRAQKV(LoRALayer):
         self.tasks = tasks
         self.layer_idx = layer_idx
         self.q = MTLoRALinear(in_features, out_features, r=r, lora_shared_scale=lora_shared_scale, lora_task_scale=lora_task_scale, lora_dropout=lora_dropout,
-                              tasks=tasks, trainable_scale_shared=trainable_scale_shared, trainable_scale_per_task=trainable_scale_per_task, shared_mode=shared_mode, layer_idx=layer_idx, **kwargs)
+                              tasks=tasks, task_to_group=task_to_group, trainable_scale_shared=trainable_scale_shared, trainable_scale_per_task=trainable_scale_per_task, shared_mode=shared_mode, layer_idx=layer_idx, **kwargs)
         self.k = MTLoRALinear(in_features, out_features, r=r, lora_shared_scale=lora_shared_scale, lora_task_scale=lora_task_scale, lora_dropout=lora_dropout,
-                              tasks=tasks, trainable_scale_shared=trainable_scale_shared, trainable_scale_per_task=trainable_scale_per_task, shared_mode=shared_mode, layer_idx=layer_idx, **kwargs)
+                              tasks=tasks, task_to_group=task_to_group, trainable_scale_shared=trainable_scale_shared, trainable_scale_per_task=trainable_scale_per_task, shared_mode=shared_mode, layer_idx=layer_idx, **kwargs)
         self.v = MTLoRALinear(in_features, out_features, r=r, lora_shared_scale=lora_shared_scale, lora_task_scale=lora_task_scale, lora_dropout=lora_dropout,
-                              tasks=tasks, trainable_scale_shared=trainable_scale_shared, trainable_scale_per_task=trainable_scale_per_task, shared_mode=shared_mode, layer_idx=layer_idx, **kwargs)
+                              tasks=tasks, task_to_group=task_to_group, trainable_scale_shared=trainable_scale_shared, trainable_scale_per_task=trainable_scale_per_task, shared_mode=shared_mode, layer_idx=layer_idx, **kwargs)
         self.has_task_lora = any(getattr(module, "has_task_lora", False) for module in (self.q, self.k, self.v))
         self.has_shared_lora = any(getattr(module, "has_shared_lora", False) for module in (self.q, self.k, self.v))
         self.shared_lora_enabled = True
@@ -381,8 +466,18 @@ class MTLoRAQKV(LoRALayer):
         )
 
     def forward(self, x: torch.Tensor, x_tasks: Dict[str, torch.Tensor] = None):
-        return (torch.cat([self.q(x, x_tasks)[0], self.k(x, x_tasks)[0], self.v(x, x_tasks)[0]], dim=-1),
-                {task: torch.cat([self.q(x, x_tasks)[1][task], self.k(x, x_tasks)[1][task], self.v(x, x_tasks)[1][task]], dim=-1) for task in self.tasks} if self.tasks is not None else None)
+        q_shared, q_tasks = self.q(x, x_tasks)
+        k_shared, k_tasks = self.k(x, x_tasks)
+        v_shared, v_tasks = self.v(x, x_tasks)
+
+        task_outputs = None
+        if self.tasks is not None and q_tasks is not None and k_tasks is not None and v_tasks is not None:
+            task_outputs = {
+                task: torch.cat([q_tasks[task], k_tasks[task], v_tasks[task]], dim=-1)
+                for task in self.tasks
+            }
+
+        return torch.cat([q_shared, k_shared, v_shared], dim=-1), task_outputs
 
 
 class LoRAQKVLinear(LoRALinear):

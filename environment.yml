@@ -146,6 +146,7 @@ dependencies:
       - mmsegmentation==1.0.0
       - numpy==1.24.1
       - opencv-python==4.7.0.72
+      - scikit-learn==1.3.2
       - pillow==10.2.0
       - prettytable==3.11.0
       - psutil==7.0.0

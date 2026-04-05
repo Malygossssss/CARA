@@ -42,13 +42,34 @@ class CompatLinear(nn.Linear):
         return super().forward(input), None
 
 def _get_shared_only_rank(mtlora, layer_idx):
+    if getattr(mtlora, "AGMTLORA_ENABLED", False):
+        return {
+            group_name: mtlora.AGMTLORA_GROUP_RANKS[group_idx][layer_idx]
+            for group_idx, group_name in enumerate(mtlora.AGMTLORA_GROUP_NAMES)
+        }
     return {'shared': mtlora.R[layer_idx]}
 
 
 def _get_layer_rank(mtlora, layer_idx, with_task_lora=False):
+    shared_rank = _get_shared_only_rank(mtlora, layer_idx)
     if with_task_lora:
-        return mtlora.R_PER_TASK_LIST[layer_idx]
-    return _get_shared_only_rank(mtlora, layer_idx)
+        layer_rank = dict(shared_rank)
+        for task, rank in mtlora.R_PER_TASK_LIST[layer_idx].items():
+            if task == 'shared':
+                continue
+            layer_rank[task] = rank
+        return layer_rank
+    return shared_rank
+
+
+def _get_task_to_group(mtlora):
+    if getattr(mtlora, "AGMTLORA_ENABLED", False):
+        return dict(mtlora.AGMTLORA_TASK_TO_GROUP)
+    return None
+
+
+def _should_route_task_streams(mtlora):
+    return bool(getattr(mtlora, "AGMTLORA_ENABLED", False))
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0., lora=False, tasks=None, mtlora=None, layer_idx=0):
@@ -58,7 +79,7 @@ class Mlp(nn.Module):
 
         linear_cls = MTLoRALinear
 
-        task_lora_tasks = tasks if (lora or mtlora.INTERMEDIATE_SPECIALIZATION) else None
+        task_lora_tasks = tasks if (lora or mtlora.INTERMEDIATE_SPECIALIZATION or _should_route_task_streams(mtlora)) else None
         if mtlora.FC1_ENABLED:
             self.fc1 = linear_cls(
                 in_features,
@@ -68,6 +89,7 @@ class Mlp(nn.Module):
                 lora_task_scale=mtlora.SCALE_PER_TASK_LIST[layer_idx],
                 lora_dropout=mtlora.DROPOUT[layer_idx],
                 tasks=task_lora_tasks,
+                task_to_group=_get_task_to_group(mtlora),
                 trainable_scale_shared=mtlora.TRAINABLE_SCALE_SHARED,
                 trainable_scale_per_task=mtlora.TRAINABLE_SCALE_PER_TASK,
                 shared_mode=mtlora.SHARED_MODE,
@@ -85,6 +107,7 @@ class Mlp(nn.Module):
                 lora_task_scale=mtlora.SCALE_PER_TASK_LIST[layer_idx],
                 lora_dropout=mtlora.DROPOUT[layer_idx],
                 tasks=task_lora_tasks,
+                task_to_group=_get_task_to_group(mtlora),
                 trainable_scale_shared=mtlora.TRAINABLE_SCALE_SHARED,
                 trainable_scale_per_task=mtlora.TRAINABLE_SCALE_PER_TASK,
                 shared_mode=mtlora.SHARED_MODE,
@@ -191,6 +214,7 @@ class WindowAttention(nn.Module):
         self.register_buffer("relative_position_index",
                              relative_position_index)
 
+        qkv_tasks = tasks if _should_route_task_streams(mtlora) else None
         if mtlora.QKV_ENABLED:
             if getattr(mtlora, "SPLIT_QKV", False):
                 qkv_cls = MTLoRAQKV
@@ -201,7 +225,8 @@ class WindowAttention(nn.Module):
                     lora_shared_scale=mtlora.SHARED_SCALE[layer_idx],
                     lora_task_scale=mtlora.SCALE_PER_TASK_LIST[layer_idx],
                     lora_dropout=mtlora.DROPOUT[layer_idx],
-                    tasks=None,
+                    tasks=qkv_tasks,
+                    task_to_group=_get_task_to_group(mtlora),
                     trainable_scale_shared=mtlora.TRAINABLE_SCALE_SHARED,
                     trainable_scale_per_task=mtlora.TRAINABLE_SCALE_PER_TASK,
                     shared_mode=mtlora.SHARED_MODE,
@@ -216,7 +241,8 @@ class WindowAttention(nn.Module):
                     lora_shared_scale=mtlora.SHARED_SCALE[layer_idx],
                     lora_task_scale=mtlora.SCALE_PER_TASK_LIST[layer_idx],
                     lora_dropout=mtlora.DROPOUT[layer_idx],
-                    tasks=None,
+                    tasks=qkv_tasks,
+                    task_to_group=_get_task_to_group(mtlora),
                     bias=qkv_bias,
                     trainable_scale_shared=mtlora.TRAINABLE_SCALE_SHARED,
                     trainable_scale_per_task=mtlora.TRAINABLE_SCALE_PER_TASK,
@@ -228,7 +254,7 @@ class WindowAttention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
 
         if mtlora.PROJ_ENABLED:
-            proj_task_lora_tasks = tasks if (lora or mtlora.INTERMEDIATE_SPECIALIZATION) else None
+            proj_task_lora_tasks = tasks if (lora or mtlora.INTERMEDIATE_SPECIALIZATION or _should_route_task_streams(mtlora)) else None
             linear_cls = MTLoRALinear
             self.proj = linear_cls(
                 dim,
@@ -238,6 +264,7 @@ class WindowAttention(nn.Module):
                 lora_task_scale=mtlora.SCALE_PER_TASK_LIST[layer_idx],
                 lora_dropout=mtlora.DROPOUT[layer_idx],
                 tasks=proj_task_lora_tasks,
+                task_to_group=_get_task_to_group(mtlora),
                 trainable_scale_shared=mtlora.TRAINABLE_SCALE_SHARED,
                 trainable_scale_per_task=mtlora.TRAINABLE_SCALE_PER_TASK,
                 shared_mode=mtlora.SHARED_MODE,
@@ -252,27 +279,21 @@ class WindowAttention(nn.Module):
         trunc_normal_(self.relative_position_bias_table, std=.02)
         self.softmax = nn.Softmax(dim=-1)
 
-    def forward(self, x, mask=None):
-        """
-        Args:
-            x: input features with shape of (num_windows*B, N, C)
-            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
-        """
-        B_, N, C = x.shape
-        qkv, _ = self.qkv(x)
-        qkv = qkv.reshape(B_, N, 3, self.num_heads, C //
-                          self.num_heads).permute(2, 0, 3, 1, 4)
-        # make torchscript happy (cannot use tensor as tuple)
+    def _reshape_qkv(self, qkv, B_, N, C):
+        return qkv.reshape(B_, N, 3, self.num_heads, C //
+                           self.num_heads).permute(2, 0, 3, 1, 4)
+
+    def _apply_attention_from_qkv(self, qkv, B_, N, C, mask=None):
+        qkv = self._reshape_qkv(qkv, B_, N, C)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
         q = q * self.scale
         attn = (q @ k.transpose(-2, -1))
 
         relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
-            # Wh*Ww,Wh*Ww,nH
             self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)
         relative_position_bias = relative_position_bias.permute(
-            2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
+            2, 0, 1).contiguous()
         attn = attn + relative_position_bias.unsqueeze(0)
 
         if mask is not None:
@@ -285,9 +306,26 @@ class WindowAttention(nn.Module):
             attn = self.softmax(attn)
 
         attn = self.attn_drop(attn)
+        return (attn @ v).transpose(1, 2).reshape(B_, N, C)
 
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
-        x, x_proj_lora_tasks = self.proj(x)
+    def forward(self, x, x_tasks=None, mask=None):
+        """
+        Args:
+            x: input features with shape of (num_windows*B, N, C)
+            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
+        """
+        B_, N, C = x.shape
+        qkv, qkv_tasks = self.qkv(x, x_tasks)
+        x = self._apply_attention_from_qkv(qkv, B_, N, C, mask=mask)
+
+        attn_task_outputs = None
+        if qkv_tasks is not None:
+            attn_task_outputs = {
+                task: self._apply_attention_from_qkv(qkv_tasks[task], B_, N, C, mask=mask)
+                for task in self.tasks
+            }
+
+        x, x_proj_lora_tasks = self.proj(x, attn_task_outputs)
         x = self.proj_drop(x)
         if x_proj_lora_tasks is not None:
             for task in self.tasks:
@@ -392,39 +430,65 @@ class SwinTransformerBlock(nn.Module):
         self.register_buffer("attn_mask", attn_mask)
         self.fused_window_process = fused_window_process
 
-    def forward(self, x):
+    def forward(self, x, x_tasks=None):
         H, W = self.input_resolution
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"
 
         shortcut = x
+        shortcut_tasks = x_tasks
         x = self.norm1(x)
         x = x.view(B, H, W, C)
+        if x_tasks is not None:
+            x_tasks = {
+                task: self.norm1(x_tasks[task]).view(B, H, W, C)
+                for task in self.tasks
+            }
 
         # cyclic shift
         if self.shift_size > 0:
-            if not self.fused_window_process:
+            if (not self.fused_window_process) or x_tasks is not None:
                 shifted_x = torch.roll(
                     x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
                 # partition windows
                 # nW*B, window_size, window_size, C
                 x_windows = window_partition(shifted_x, self.window_size)
+                x_windows_tasks = None
+                if x_tasks is not None:
+                    x_windows_tasks = {
+                        task: window_partition(
+                            torch.roll(x_tasks[task], shifts=(-self.shift_size, -self.shift_size), dims=(1, 2)),
+                            self.window_size,
+                        )
+                        for task in self.tasks
+                    }
             else:
                 x_windows = WindowProcess.apply(
                     x, B, H, W, C, -self.shift_size, self.window_size)
+                x_windows_tasks = None
         else:
             shifted_x = x
             # partition windows
             # nW*B, window_size, window_size, C
             x_windows = window_partition(shifted_x, self.window_size)
+            x_windows_tasks = None
+            if x_tasks is not None:
+                x_windows_tasks = {
+                    task: window_partition(x_tasks[task], self.window_size)
+                    for task in self.tasks
+                }
 
         # nW*B, window_size*window_size, C
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
+        if x_windows_tasks is not None:
+            for task in self.tasks:
+                x_windows_tasks[task] = x_windows_tasks[task].view(
+                    -1, self.window_size * self.window_size, C)
 
         # W-MSA/SW-MSA
         # nW*B, window_size*window_size, C
         attn_windows, attn_windows_lora_tasks = self.attn(
-            x_windows, mask=self.attn_mask)
+            x_windows, x_windows_tasks, mask=self.attn_mask)
 
         # merge windows
         attn_windows = attn_windows.view(-1,
@@ -455,21 +519,30 @@ class SwinTransformerBlock(nn.Module):
                         self.shift_size, self.shift_size), dims=(1, 2))
                 attn_windows_lora_tasks[task] = attn_windows_lora_tasks[task].view(
                     B, H * W, C)
-                attn_windows_lora_tasks[task] = shortcut + \
+                shortcut_base = shortcut if shortcut_tasks is None else shortcut_tasks[task]
+                attn_windows_lora_tasks[task] = shortcut_base + \
                     self.drop_path(attn_windows_lora_tasks[task])
         x = x.view(B, H * W, C)
         x = shortcut + self.drop_path(x)
 
         # FFN
+        if attn_windows_lora_tasks is None:
+            mlp_inputs = None
+        else:
+            mlp_inputs = {
+                task: self.norm2(attn_windows_lora_tasks[task]) for task in self.tasks
+            }
         mlp_result, mlp_lora_tasks = self.mlp(
-            self.norm2(x), {task: self.norm2(attn_windows_lora_tasks[task]) for task in self.tasks} if attn_windows_lora_tasks is not None else None)
+            self.norm2(x), mlp_inputs)
 
         if mlp_lora_tasks is None:
             return x + self.drop_path(mlp_result), None
         else:
             if attn_windows_lora_tasks is None:
+                if shortcut_tasks is None:
+                    shortcut_tasks = {task: shortcut for task in self.tasks}
                 for task in self.tasks:
-                    mlp_lora_tasks[task] = self.drop_path(mlp_lora_tasks[task])
+                    mlp_lora_tasks[task] = shortcut_tasks[task] + self.drop_path(mlp_lora_tasks[task])
             else:
                 for task in self.tasks:
                     mlp_lora_tasks[task] = attn_windows_lora_tasks[task] + \
@@ -621,15 +694,15 @@ class BasicLayer(nn.Module):
         else:
             self.downsample = None
 
-    def forward(self, x):
+    def forward(self, x, x_tasks=None):
         for blk in self.blocks:
-            x, tasks_lora = blk(x)
+            x, x_tasks = blk(x, x_tasks)
         if self.downsample is not None:
             x = self.downsample(x)
-            if tasks_lora is not None:
+            if x_tasks is not None:
                 for task in self.tasks:
-                    tasks_lora[task] = self.downsample(tasks_lora[task])
-        return x, tasks_lora
+                    x_tasks[task] = self.downsample(x_tasks[task])
+        return x, x_tasks
 
     def extra_repr(self) -> str:
         return f"dim={self.dim}, input_resolution={self.input_resolution}, depth={self.depth}"
@@ -867,14 +940,15 @@ class SwinTransformerMTLoRA(nn.Module):
         x = self.pos_drop(x)
         if return_stages:
             out = []
-        i = 0
+        x_tasks = None
+        route_task_streams = bool(getattr(self.mtlora, "AGMTLORA_ENABLED", False))
         for layer in self.layers:
-            x, tasks_lora = layer(x)
+            x, x_tasks = layer(x, x_tasks if route_task_streams else None)
+            tasks_lora = x_tasks
             if tasks_lora is None:
                 tasks_lora = {task: x for task in self.tasks}
             if return_stages:
                 out.append((x, tasks_lora))
-            i = i + 1
 
         if return_stages:
             return out
