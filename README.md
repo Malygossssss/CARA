@@ -59,6 +59,8 @@ python -m torch.distributed.launch --nproc_per_node 1 main.py \
   --tasks semseg,normals,sal,human_parts \
   --batch-size 8 \
   --epochs 300 \
+  --ckpt-freq=20 \
+  --eval-freq=5 \
   --resume-backbone backbone/swin_tiny_patch4_window7_224.pth
 ```
 
@@ -82,6 +84,9 @@ python -m torch.distributed.launch --nproc_per_node 1 main.py \
   --nyud /path/to/NYUD_MT \
   --tasks semseg,normals,depth,edge \
   --batch-size 8 \
+  --epochs 300 \
+  --ckpt-freq=20 \
+  --eval-freq=5 \
   --resume-backbone backbone/swin_tiny_patch4_window7_224.pth
 ```
 
