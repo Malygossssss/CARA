@@ -41,6 +41,38 @@ def group_to_key(group: Sequence[str]) -> str:
     return "|".join(group)
 
 
+def safe_num_batches(data_loader) -> int:
+    try:
+        return int(len(data_loader))
+    except TypeError:
+        return 0
+
+
+def resolve_log_interval(total_steps: int, target_updates: int = 5) -> int:
+    if total_steps <= 0:
+        return 50
+    return max(1, total_steps // max(int(target_updates), 1))
+
+
+def maybe_log_progress(logger, phase: str, step_idx: int, total_steps: int, log_interval: int, extra: str = "") -> None:
+    should_log = (
+        step_idx == 1
+        or step_idx == total_steps
+        or (log_interval > 0 and step_idx % log_interval == 0)
+    )
+    if not should_log:
+        return
+    suffix = f" | {extra}" if extra else ""
+    if total_steps > 0:
+        logger.info("%s: %d/%d%s", phase, step_idx, total_steps, suffix)
+    else:
+        logger.info("%s: %d%s", phase, step_idx, suffix)
+
+
+def round_value_map(values: Dict[str, float], digits: int = 6) -> Dict[str, float]:
+    return {key: round(float(value), digits) for key, value in values.items()}
+
+
 def set_random_seed(seed: int) -> None:
     random.seed(int(seed))
     np.random.seed(int(seed))
@@ -254,18 +286,49 @@ def short_train_model(
     model = build_task_model(config, device, logger, init_state_dict=init_state_dict)
     criterion, loss_ft, _ = build_loss_bundle(config)
     optimizer = build_optimizer(config, model)
+    num_train_batches = safe_num_batches(data_loader_train)
+    num_val_batches = safe_num_batches(data_loader_val)
+    train_log_interval = resolve_log_interval(num_train_batches)
+
+    logger.info(
+        "Predictor short-train start | tasks=%s | epochs=%d | train_batches=%d | val_batches=%d | output=%s",
+        list(config.TASKS),
+        int(num_epochs),
+        num_train_batches,
+        num_val_batches,
+        config.OUTPUT,
+    )
 
     model.train()
     for epoch_idx in range(int(num_epochs)):
-        for batch in data_loader_train:
+        logger.info(
+            "Predictor short-train epoch %d/%d | tasks=%s",
+            epoch_idx + 1,
+            int(num_epochs),
+            list(config.TASKS),
+        )
+        for batch_idx, batch in enumerate(data_loader_train, start=1):
             samples, targets = move_batch_to_device(batch, config.TASKS, device)
             outputs = model(samples)
             loss, _ = criterion(outputs, targets)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            maybe_log_progress(
+                logger,
+                f"Predictor short-train epoch {epoch_idx + 1}/{int(num_epochs)}",
+                batch_idx,
+                num_train_batches,
+                train_log_interval,
+                extra=f"loss={float(loss.item()):.6f}",
+            )
 
     val_losses = evaluate_task_losses(model, data_loader_val, loss_ft, config.TASKS, device)
+    logger.info(
+        "Predictor short-train finished | tasks=%s | val_losses=%s",
+        list(config.TASKS),
+        round_value_map(val_losses),
+    )
     trained_state = clone_state_dict_to_cpu(model)
     del dataset_train, dataset_val, data_loader_train, data_loader_val
     del optimizer, criterion, loss_ft, model
@@ -327,18 +390,39 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str):
     model = build_task_model(config, device, logger)
     criterion, loss_ft, _ = build_loss_bundle(config)
     optimizer = build_optimizer(config, model)
+    num_train_batches = safe_num_batches(data_loader_train)
+    num_val_batches = safe_num_batches(data_loader_val)
+    train_log_interval = resolve_log_interval(num_train_batches)
+
+    logger.info(
+        "Stage-1 Step A start | tasks=%s | warmup_epochs=%d | train_batches=%d | val_batches=%d | output=%s",
+        list(config.TASKS),
+        int(config.MODEL.AGMTLORA.AFFINITY_COLLECT_EPOCHS),
+        num_train_batches,
+        num_val_batches,
+        working_dir,
+    )
 
     warmup_epochs = int(config.MODEL.AGMTLORA.AFFINITY_COLLECT_EPOCHS)
     if warmup_epochs > 0:
-        for _ in range(warmup_epochs):
+        for epoch_idx in range(warmup_epochs):
+            logger.info("Warmup epoch %d/%d started", epoch_idx + 1, warmup_epochs)
             model.train()
-            for batch in data_loader_train:
+            for batch_idx, batch in enumerate(data_loader_train, start=1):
                 samples, targets = move_batch_to_device(batch, config.TASKS, device)
                 outputs = model(samples)
                 loss, _ = criterion(outputs, targets)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+                maybe_log_progress(
+                    logger,
+                    f"Warmup epoch {epoch_idx + 1}/{warmup_epochs}",
+                    batch_idx,
+                    num_train_batches,
+                    train_log_interval,
+                    extra=f"loss={float(loss.item()):.6f}",
+                )
 
     warmup_checkpoint_path = os.path.join(working_dir, "warmup_checkpoint.pth")
     mkdir_if_missing(os.path.dirname(warmup_checkpoint_path))
@@ -353,14 +437,20 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str):
         },
         warmup_checkpoint_path,
     )
+    logger.info("Warmup checkpoint saved to %s", warmup_checkpoint_path)
 
     shared_params = get_shared_ta_parameters(model)
     task_index = {task: idx for idx, task in enumerate(config.TASKS)}
     directed_sum = torch.zeros((len(config.TASKS), len(config.TASKS)), dtype=torch.float32, device=device)
     affinity_batches = 0
 
+    logger.info(
+        "Collecting directed affinity on shared TA-LoRA parameters | tasks=%s | train_batches=%d",
+        list(config.TASKS),
+        num_train_batches,
+    )
     model.train()
-    for batch in data_loader_train:
+    for batch_idx, batch in enumerate(data_loader_train, start=1):
         samples, targets = move_batch_to_device(batch, config.TASKS, device)
         optimizer.zero_grad()
         outputs = model(samples)
@@ -392,11 +482,24 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str):
         loss, _ = criterion(outputs, targets)
         loss.backward()
         optimizer.step()
+        maybe_log_progress(
+            logger,
+            "Directed affinity collection",
+            batch_idx,
+            num_train_batches,
+            train_log_interval,
+            extra=f"loss={float(loss.item()):.6f}",
+        )
 
     directed_affinity = (directed_sum / max(float(affinity_batches), 1.0)).detach().cpu().numpy()
     symmetric_affinity = 0.5 * (directed_affinity + directed_affinity.T)
     val_losses = evaluate_task_losses(model, data_loader_val, loss_ft, config.TASKS, device)
     warmup_state_dict = clone_state_dict_to_cpu(model)
+    logger.info(
+        "Stage-1 Step A finished | affinity_batches=%d | validation_losses=%s",
+        affinity_batches,
+        round_value_map(val_losses),
+    )
 
     del dataset_train, dataset_val, data_loader_train, data_loader_val
     del optimizer, criterion, loss_ft, model
@@ -450,8 +553,16 @@ def collect_predictor_training_targets(
         [group for group in train_groups if len(group) == 1],
         base_config.TASKS,
     )
+    multitask_groups = [group for group in train_groups if len(group) > 1]
+    logger.info(
+        "Stage-1 Step B start | predictor_train_groups=%d | singleton_groups=%d | multitask_groups=%d",
+        len(train_groups),
+        len(singleton_groups),
+        len(multitask_groups),
+    )
     for singleton_group in singleton_groups:
         task = singleton_group[0]
+        logger.info("Predictor target collection | singleton group=%s", singleton_group)
         task_output_dir = os.path.join(working_dir, "predictor_runs", f"singleton__{task}")
         task_config = rebuild_task_config(base_config, [task], output_dir=task_output_dir)
         _, val_losses = short_train_model(
@@ -463,12 +574,18 @@ def collect_predictor_training_targets(
         )
         singleton_losses[task] = float(val_losses[task])
         predictor_targets[group_to_key([task])] = {task: 0.0}
+        logger.info(
+            "Predictor target collected | singleton task=%s | val_loss=%.6f",
+            task,
+            singleton_losses[task],
+        )
 
     for group in train_groups:
         group = list(group)
         if len(group) == 1:
             continue
         group_key = group_to_key(group)
+        logger.info("Predictor target collection | group=%s", group)
         group_output_dir = os.path.join(working_dir, "predictor_runs", f"group__{group_key.replace('|', '__')}")
         group_config = rebuild_task_config(base_config, group, output_dir=group_output_dir)
         _, val_losses = short_train_model(
@@ -481,6 +598,11 @@ def collect_predictor_training_targets(
         predictor_targets[group_key] = {}
         for task in group:
             predictor_targets[group_key][task] = float(singleton_losses[task] - val_losses[task])
+        logger.info(
+            "Predictor target collected | group=%s | gains=%s",
+            group,
+            round_value_map(predictor_targets[group_key]),
+        )
 
     return predictor_targets, singleton_losses
 
@@ -549,6 +671,7 @@ def fit_base_predictor(train_pairs: List[Dict], predictor_name: str, predictor_k
         "affine_a": affine_a,
         "affine_b": affine_b,
         "model": model,
+        "num_samples": int(x.shape[0]),
     }
 
 
@@ -667,6 +790,7 @@ def create_resolved_training_config(base_config: CN, grouping_json_path: str, re
 
 def run_stage1_pipeline(config: CN, output_root: str, logger):
     mkdir_if_missing(output_root)
+    logger.info("AG-MTLoRA Stage-1 pipeline started | output_root=%s", output_root)
 
     affinity_result = warmup_and_collect_affinity(config, logger, output_root)
     directed_affinity = affinity_result["directed_affinity"]
@@ -700,6 +824,7 @@ def run_stage1_pipeline(config: CN, output_root: str, logger):
         save_matrix_csv(config.TASKS, symmetric_affinity, affinity_sym_csv_path)
 
     candidate_groups = enumerate_candidate_groups(config.TASKS)
+    logger.info("Enumerated candidate groups | num_tasks=%d | num_candidate_groups=%d", len(config.TASKS), len(candidate_groups))
     group_proxy, group_proxy_rows = build_group_proxy(directed_affinity, config.TASKS, candidate_groups)
     group_proxy_json_path = os.path.join(output_root, "group_proxy.json")
     group_proxy_csv_path = os.path.join(output_root, "group_proxy.csv")
@@ -712,6 +837,10 @@ def run_stage1_pipeline(config: CN, output_root: str, logger):
         config.MODEL.AGMTLORA.PREDICTOR_TRAIN_GROUP_STRATEGY,
         int(config.SEED),
     )
+    logger.info("Selected predictor train groups | budget=%d | selected=%d | groups=%s",
+                int(config.MODEL.AGMTLORA.PREDICTOR_TRAIN_GROUP_BUDGET),
+                len(predictor_train_groups),
+                predictor_train_groups)
     predictor_targets, singleton_losses = collect_predictor_training_targets(
         config,
         logger,
@@ -750,6 +879,13 @@ def run_stage1_pipeline(config: CN, output_root: str, logger):
         config.MODEL.AGMTLORA.BASE_PREDICTOR,
         dict(config.MODEL.AGMTLORA.BASE_PREDICTOR_KWARGS),
     )
+    logger.info(
+        "Base predictor fitted | type=%s | samples=%d | affine_a=%.6f | affine_b=%.6f",
+        base_predictor["predictor_name"],
+        base_predictor["num_samples"],
+        float(base_predictor["affine_a"]),
+        float(base_predictor["affine_b"]),
+    )
 
     initial_train_predictions = {}
     for group in predictor_train_groups:
@@ -766,6 +902,11 @@ def run_stage1_pipeline(config: CN, output_root: str, logger):
         predictor_train_groups,
         predictor_targets,
         initial_train_predictions,
+        float(config.MODEL.AGMTLORA.RESIDUAL_ALPHA),
+    )
+    logger.info(
+        "Residual predictor fitted | type=%s | alpha=%.6f",
+        str(config.MODEL.AGMTLORA.RESIDUAL_PREDICTOR),
         float(config.MODEL.AGMTLORA.RESIDUAL_ALPHA),
     )
 
@@ -791,6 +932,13 @@ def run_stage1_pipeline(config: CN, output_root: str, logger):
         config.TASKS,
         final_predictions,
         int(config.MODEL.AGMTLORA.MAX_GROUPS),
+    )
+    logger.info(
+        "Partition search finished | max_groups=%d | num_partitions=%d | best_groups=%s | best_score=%.6f",
+        int(config.MODEL.AGMTLORA.MAX_GROUPS),
+        len(ranked_partitions),
+        ranked_partitions[0]["groups"],
+        float(ranked_partitions[0]["partition_score"]),
     )
     partition_results_path = os.path.join(output_root, "partition_search_results.json")
     partition_results_csv = os.path.join(output_root, "partition_search_results.csv")
@@ -829,12 +977,14 @@ def run_stage1_pipeline(config: CN, output_root: str, logger):
     }
     grouping_json_path = config.MODEL.AGMTLORA.GROUPING_SAVE_PATH
     save_json(grouping_payload, grouping_json_path)
+    logger.info("Grouping saved to %s", grouping_json_path)
 
     resolved_config = create_resolved_training_config(config, grouping_json_path, resolved_group_ranks)
     resolved_config_path = os.path.join(output_root, "resolved_agmtlora_config.yaml")
     mkdir_if_missing(os.path.dirname(resolved_config_path))
     with open(resolved_config_path, "w", encoding="utf-8") as handle:
         handle.write(resolved_config.dump())
+    logger.info("Resolved AG-MTLoRA training config saved to %s", resolved_config_path)
 
     return {
         "affinity_json_path": affinity_json_path,
