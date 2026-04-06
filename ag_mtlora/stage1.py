@@ -73,6 +73,17 @@ def round_value_map(values: Dict[str, float], digits: int = 6) -> Dict[str, floa
     return {key: round(float(value), digits) for key, value in values.items()}
 
 
+def get_affinity_warmup_epochs(config: CN) -> int:
+    warmup_epochs = int(getattr(config.MODEL.AGMTLORA, "AFFINITY_WARMUP_EPOCHS", -1))
+    if warmup_epochs >= 0:
+        return warmup_epochs
+    return int(config.MODEL.AGMTLORA.AFFINITY_COLLECT_EPOCHS)
+
+
+def get_affinity_score_epochs(config: CN) -> int:
+    return int(getattr(config.MODEL.AGMTLORA, "AFFINITY_SCORE_EPOCHS", 50))
+
+
 def set_random_seed(seed: int) -> None:
     random.seed(int(seed))
     np.random.seed(int(seed))
@@ -95,6 +106,18 @@ def save_matrix_csv(tasks: Sequence[str], matrix: np.ndarray, output_path: str) 
         writer.writerow(["task"] + list(tasks))
         for task, row in zip(tasks, matrix.tolist()):
             writer.writerow([task] + row)
+
+
+def save_affinity_epoch_history_csv(tasks: Sequence[str], epoch_history: Sequence[np.ndarray], output_path: str) -> None:
+    mkdir_if_missing(os.path.dirname(output_path))
+    with open(output_path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["epoch", "source_task", "target_task", "value"])
+        for epoch_idx, epoch_matrix in enumerate(epoch_history, start=1):
+            epoch_matrix = np.asarray(epoch_matrix)
+            for src_idx, src_task in enumerate(tasks):
+                for dst_idx, dst_task in enumerate(tasks):
+                    writer.writerow([epoch_idx, src_task, dst_task, float(epoch_matrix[src_idx, dst_idx])])
 
 
 def save_group_task_rows(rows: Iterable[Dict], output_path: str, value_key: str) -> None:
@@ -393,17 +416,19 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str):
     num_train_batches = safe_num_batches(data_loader_train)
     num_val_batches = safe_num_batches(data_loader_val)
     train_log_interval = resolve_log_interval(num_train_batches)
+    warmup_epochs = get_affinity_warmup_epochs(config)
+    affinity_score_epochs = get_affinity_score_epochs(config)
 
     logger.info(
-        "Stage-1 Step A start | tasks=%s | warmup_epochs=%d | train_batches=%d | val_batches=%d | output=%s",
+        "Stage-1 Step A start | tasks=%s | warmup_epochs=%d | affinity_score_epochs=%d | train_batches=%d | val_batches=%d | output=%s",
         list(config.TASKS),
-        int(config.MODEL.AGMTLORA.AFFINITY_COLLECT_EPOCHS),
+        warmup_epochs,
+        affinity_score_epochs,
         num_train_batches,
         num_val_batches,
         working_dir,
     )
 
-    warmup_epochs = int(config.MODEL.AGMTLORA.AFFINITY_COLLECT_EPOCHS)
     if warmup_epochs > 0:
         for epoch_idx in range(warmup_epochs):
             logger.info("Warmup epoch %d/%d started", epoch_idx + 1, warmup_epochs)
@@ -423,82 +448,137 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str):
                     train_log_interval,
                     extra=f"loss={float(loss.item()):.6f}",
                 )
+    else:
+        logger.info("Warmup is skipped because AFFINITY_WARMUP_EPOCHS=%d", warmup_epochs)
+
+    warmup_validation_losses = evaluate_task_losses(model, data_loader_val, loss_ft, config.TASKS, device)
+    warmup_state_dict = clone_state_dict_to_cpu(model)
 
     warmup_checkpoint_path = os.path.join(working_dir, "warmup_checkpoint.pth")
     mkdir_if_missing(os.path.dirname(warmup_checkpoint_path))
     torch.save(
         {
-            "model": model.state_dict(),
+            "model": warmup_state_dict,
             "epoch": max(0, warmup_epochs - 1),
             "extra_state": {
                 "stage": "ag_mtlora_stage1_warmup",
                 "tasks": list(config.TASKS),
+                "affinity_warmup_epochs": warmup_epochs,
+                "affinity_score_epochs": affinity_score_epochs,
             },
         },
         warmup_checkpoint_path,
     )
-    logger.info("Warmup checkpoint saved to %s", warmup_checkpoint_path)
+    logger.info(
+        "Warmup checkpoint saved to %s | warmup_validation_losses=%s",
+        warmup_checkpoint_path,
+        round_value_map(warmup_validation_losses),
+    )
 
     shared_params = get_shared_ta_parameters(model)
     task_index = {task: idx for idx, task in enumerate(config.TASKS)}
-    directed_sum = torch.zeros((len(config.TASKS), len(config.TASKS)), dtype=torch.float32, device=device)
-    affinity_batches = 0
+    affinity_epoch_history = []
+    num_batches_per_epoch = []
 
     logger.info(
-        "Collecting directed affinity on shared TA-LoRA parameters | tasks=%s | train_batches=%d",
+        "Collecting directed affinity on shared TA-LoRA parameters | tasks=%s | affinity_score_epochs=%d | train_batches=%d",
         list(config.TASKS),
+        affinity_score_epochs,
         num_train_batches,
     )
-    model.train()
-    for batch_idx, batch in enumerate(data_loader_train, start=1):
-        samples, targets = move_batch_to_device(batch, config.TASKS, device)
-        optimizer.zero_grad()
-        outputs = model(samples)
+    if affinity_score_epochs == 0:
+        logger.info("Affinity score collection is skipped because AFFINITY_SCORE_EPOCHS=0")
 
-        flat_gradients = {}
-        pseudo_updates = {}
-        for task in config.TASKS:
-            task_loss = loss_ft[task](outputs[task], targets[task])
-            grads = torch.autograd.grad(
-                task_loss,
-                shared_params,
-                retain_graph=True,
-                allow_unused=True,
+    for affinity_epoch_idx in range(affinity_score_epochs):
+        logger.info("Affinity epoch %d/%d started", affinity_epoch_idx + 1, affinity_score_epochs)
+        epoch_directed_sum = torch.zeros((len(config.TASKS), len(config.TASKS)), dtype=torch.float32, device=device)
+        epoch_batches = 0
+        model.train()
+        for batch_idx, batch in enumerate(data_loader_train, start=1):
+            samples, targets = move_batch_to_device(batch, config.TASKS, device)
+            optimizer.zero_grad()
+            outputs = model(samples)
+
+            flat_gradients = {}
+            pseudo_updates = {}
+            for task in config.TASKS:
+                task_loss = loss_ft[task](outputs[task], targets[task])
+                grads = torch.autograd.grad(
+                    task_loss,
+                    shared_params,
+                    retain_graph=True,
+                    allow_unused=True,
+                )
+                flat_grad = flatten_gradient_list(shared_params, grads)
+                flat_gradients[task] = flat_grad
+                pseudo_updates[task] = build_pseudo_update(flat_grad, optimizer)
+
+            lr = float(optimizer.param_groups[0]["lr"])
+            for src_task in config.TASKS:
+                src_idx = task_index[src_task]
+                for dst_task in config.TASKS:
+                    dst_idx = task_index[dst_task]
+                    epoch_directed_sum[src_idx, dst_idx] += torch.dot(
+                        flat_gradients[dst_task], pseudo_updates[src_task]
+                    ) / max(lr, 1e-12)
+            epoch_batches += 1
+
+            loss, _ = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+            maybe_log_progress(
+                logger,
+                f"Affinity epoch {affinity_epoch_idx + 1}/{affinity_score_epochs}",
+                batch_idx,
+                num_train_batches,
+                train_log_interval,
+                extra=f"loss={float(loss.item()):.6f}",
             )
-            flat_grad = flatten_gradient_list(shared_params, grads)
-            flat_gradients[task] = flat_grad
-            pseudo_updates[task] = build_pseudo_update(flat_grad, optimizer)
 
-        lr = float(optimizer.param_groups[0]["lr"])
-        for src_task in config.TASKS:
-            src_idx = task_index[src_task]
-            for dst_task in config.TASKS:
-                dst_idx = task_index[dst_task]
-                directed_sum[src_idx, dst_idx] += torch.dot(
-                    flat_gradients[dst_task], pseudo_updates[src_task]
-                ) / max(lr, 1e-12)
-        affinity_batches += 1
-
-        loss, _ = criterion(outputs, targets)
-        loss.backward()
-        optimizer.step()
-        maybe_log_progress(
-            logger,
-            "Directed affinity collection",
-            batch_idx,
-            num_train_batches,
-            train_log_interval,
-            extra=f"loss={float(loss.item()):.6f}",
+        epoch_directed_affinity = (epoch_directed_sum / max(float(epoch_batches), 1.0)).detach().cpu().numpy()
+        affinity_epoch_history.append(epoch_directed_affinity)
+        num_batches_per_epoch.append(int(epoch_batches))
+        epoch_matrix_stats = {
+            "mean": float(np.mean(epoch_directed_affinity)),
+            "std": float(np.std(epoch_directed_affinity)),
+            "min": float(np.min(epoch_directed_affinity)),
+            "max": float(np.max(epoch_directed_affinity)),
+        }
+        logger.info(
+            "Affinity epoch %d/%d finished | epoch_batches=%d | epoch_directed_matrix_stats=%s",
+            affinity_epoch_idx + 1,
+            affinity_score_epochs,
+            epoch_batches,
+            round_value_map(epoch_matrix_stats),
         )
 
-    directed_affinity = (directed_sum / max(float(affinity_batches), 1.0)).detach().cpu().numpy()
+    if affinity_epoch_history:
+        directed_affinity = np.mean(np.stack(affinity_epoch_history, axis=0), axis=0)
+    else:
+        directed_affinity = np.zeros((len(config.TASKS), len(config.TASKS)), dtype=np.float32)
     symmetric_affinity = 0.5 * (directed_affinity + directed_affinity.T)
-    val_losses = evaluate_task_losses(model, data_loader_val, loss_ft, config.TASKS, device)
-    warmup_state_dict = clone_state_dict_to_cpu(model)
+    post_affinity_validation_losses = evaluate_task_losses(model, data_loader_val, loss_ft, config.TASKS, device)
+    post_affinity_state_dict = clone_state_dict_to_cpu(model)
+    post_affinity_checkpoint_path = os.path.join(working_dir, "post_affinity_checkpoint.pth")
+    torch.save(
+        {
+            "model": post_affinity_state_dict,
+            "epoch": max(0, warmup_epochs + affinity_score_epochs - 1) if (warmup_epochs + affinity_score_epochs) > 0 else 0,
+            "extra_state": {
+                "stage": "ag_mtlora_stage1_post_affinity",
+                "tasks": list(config.TASKS),
+                "affinity_warmup_epochs": warmup_epochs,
+                "affinity_score_epochs": affinity_score_epochs,
+            },
+        },
+        post_affinity_checkpoint_path,
+    )
     logger.info(
-        "Stage-1 Step A finished | affinity_batches=%d | validation_losses=%s",
-        affinity_batches,
-        round_value_map(val_losses),
+        "Stage-1 Step A finished | num_affinity_epochs=%d | num_batches_per_epoch=%s | post_affinity_validation_losses=%s | post_affinity_checkpoint=%s",
+        affinity_score_epochs,
+        num_batches_per_epoch,
+        round_value_map(post_affinity_validation_losses),
+        post_affinity_checkpoint_path,
     )
 
     del dataset_train, dataset_val, data_loader_train, data_loader_val
@@ -509,10 +589,17 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str):
     return {
         "warmup_checkpoint_path": warmup_checkpoint_path,
         "warmup_state_dict": warmup_state_dict,
+        "warmup_validation_losses": warmup_validation_losses,
+        "post_affinity_checkpoint_path": post_affinity_checkpoint_path,
+        "post_affinity_state_dict": post_affinity_state_dict,
+        "post_affinity_validation_losses": post_affinity_validation_losses,
         "directed_affinity": directed_affinity,
         "symmetric_affinity": symmetric_affinity,
-        "validation_losses": val_losses,
-        "num_batches": affinity_batches,
+        "affinity_epoch_history": affinity_epoch_history,
+        "num_batches_per_epoch": num_batches_per_epoch,
+        "num_affinity_epochs": affinity_score_epochs,
+        "validation_losses": post_affinity_validation_losses,
+        "num_batches": int(sum(num_batches_per_epoch)),
     }
 
 
@@ -541,7 +628,7 @@ def build_group_proxy(directed_affinity: np.ndarray, tasks: Sequence[str], candi
 def collect_predictor_training_targets(
     base_config: CN,
     logger,
-    warmup_state_dict: Dict[str, torch.Tensor],
+    baseline_state_dict: Dict[str, torch.Tensor],
     train_groups: Sequence[Sequence[str]],
     working_dir: str,
 ):
@@ -568,7 +655,7 @@ def collect_predictor_training_targets(
         _, val_losses = short_train_model(
             task_config,
             logger,
-            warmup_state_dict,
+            baseline_state_dict,
             task_config.MODEL.AGMTLORA.PREDICTOR_GROUP_TRAIN_EPOCHS,
             device,
         )
@@ -591,7 +678,7 @@ def collect_predictor_training_targets(
         _, val_losses = short_train_model(
             group_config,
             logger,
-            warmup_state_dict,
+            baseline_state_dict,
             group_config.MODEL.AGMTLORA.PREDICTOR_GROUP_TRAIN_EPOCHS,
             device,
         )
@@ -795,23 +882,42 @@ def run_stage1_pipeline(config: CN, output_root: str, logger):
     affinity_result = warmup_and_collect_affinity(config, logger, output_root)
     directed_affinity = affinity_result["directed_affinity"]
     symmetric_affinity = affinity_result["symmetric_affinity"]
+    affinity_warmup_epochs = get_affinity_warmup_epochs(config)
+    affinity_score_epochs = get_affinity_score_epochs(config)
 
     affinity_json_path = config.MODEL.AGMTLORA.AFFINITY_SAVE_PATH
     affinity_csv_path = os.path.splitext(affinity_json_path)[0] + ".csv"
     affinity_sym_json_path = os.path.join(os.path.dirname(affinity_json_path), "affinity_symmetric.json")
     affinity_sym_csv_path = os.path.join(os.path.dirname(affinity_json_path), "affinity_symmetric.csv")
+    affinity_epoch_history_json = os.path.join(os.path.dirname(affinity_json_path), "affinity_epoch_history.json")
+    affinity_epoch_history_csv = os.path.join(os.path.dirname(affinity_json_path), "affinity_epoch_history.csv")
 
     save_json(
         {
             "tasks": list(config.TASKS),
             "directed_affinity": directed_affinity.tolist(),
-            "num_batches": int(affinity_result["num_batches"]),
+            "num_affinity_epochs": int(affinity_result["num_affinity_epochs"]),
+            "num_batches_per_epoch": list(affinity_result["num_batches_per_epoch"]),
+            "affinity_epoch_history_path": affinity_epoch_history_json,
             "warmup_checkpoint": affinity_result["warmup_checkpoint_path"],
-            "warmup_validation_losses": affinity_result["validation_losses"],
+            "post_affinity_checkpoint": affinity_result["post_affinity_checkpoint_path"],
+            "warmup_validation_losses": affinity_result["warmup_validation_losses"],
+            "post_affinity_validation_losses": affinity_result["post_affinity_validation_losses"],
         },
         affinity_json_path,
     )
     save_matrix_csv(config.TASKS, directed_affinity, affinity_csv_path)
+    save_json(
+        {
+            "tasks": list(config.TASKS),
+            "affinity_warmup_epochs": affinity_warmup_epochs,
+            "affinity_score_epochs": affinity_score_epochs,
+            "num_batches_per_epoch": list(affinity_result["num_batches_per_epoch"]),
+            "epoch_directed_affinity": [matrix.tolist() for matrix in affinity_result["affinity_epoch_history"]],
+        },
+        affinity_epoch_history_json,
+    )
+    save_affinity_epoch_history_csv(config.TASKS, affinity_result["affinity_epoch_history"], affinity_epoch_history_csv)
 
     if config.MODEL.AGMTLORA.VISUALIZE_SYMMETRIC_AFFINITY:
         save_json(
@@ -844,7 +950,7 @@ def run_stage1_pipeline(config: CN, output_root: str, logger):
     predictor_targets, singleton_losses = collect_predictor_training_targets(
         config,
         logger,
-        affinity_result["warmup_state_dict"],
+        affinity_result["post_affinity_state_dict"],
         predictor_train_groups,
         output_root,
     )
@@ -972,6 +1078,9 @@ def run_stage1_pipeline(config: CN, output_root: str, logger):
         "affinity_path": affinity_json_path,
         "final_predictions_path": final_predictions_json,
         "warmup_checkpoint": affinity_result["warmup_checkpoint_path"],
+        "post_affinity_checkpoint": affinity_result["post_affinity_checkpoint_path"],
+        "affinity_warmup_epochs": affinity_warmup_epochs,
+        "affinity_score_epochs": affinity_score_epochs,
         "partition_search_results": partition_results_path,
         "group_rank_source": rank_source,
     }
@@ -988,6 +1097,8 @@ def run_stage1_pipeline(config: CN, output_root: str, logger):
 
     return {
         "affinity_json_path": affinity_json_path,
+        "affinity_epoch_history_json": affinity_epoch_history_json,
+        "affinity_epoch_history_csv": affinity_epoch_history_csv,
         "group_proxy_json_path": group_proxy_json_path,
         "predictor_train_groups_json": predictor_train_groups_json,
         "predictor_train_groups_csv": predictor_train_groups_csv,
@@ -999,6 +1110,7 @@ def run_stage1_pipeline(config: CN, output_root: str, logger):
         "grouping_json_path": grouping_json_path,
         "resolved_config_path": resolved_config_path,
         "warmup_checkpoint_path": affinity_result["warmup_checkpoint_path"],
+        "post_affinity_checkpoint_path": affinity_result["post_affinity_checkpoint_path"],
     }
 
 

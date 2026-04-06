@@ -352,6 +352,8 @@ _C.MODEL.AGMTLORA.GROUP_RANK_ALLOCATION = 'equal_split'
 _C.MODEL.AGMTLORA.GROUPING_SOURCE = 'search'  # search, fixed_json
 _C.MODEL.AGMTLORA.GROUPING_JSON = ''
 _C.MODEL.AGMTLORA.AFFINITY_COLLECT_EPOCHS = 5
+_C.MODEL.AGMTLORA.AFFINITY_WARMUP_EPOCHS = -1
+_C.MODEL.AGMTLORA.AFFINITY_SCORE_EPOCHS = 50
 _C.MODEL.AGMTLORA.AFFINITY_SAVE_PATH = ''
 _C.MODEL.AGMTLORA.GROUPING_SAVE_PATH = ''
 _C.MODEL.AGMTLORA.SEARCH_OBJECTIVE = 'mean_final_predicted_gain'
@@ -625,6 +627,10 @@ def update_config(config, args):
             raise ValueError("AGMTLoRA requires MODEL.MTLORA.ENABLED=True.")
         if int(config.MODEL.AGMTLORA.STAGE) != 1:
             raise ValueError("Only AG-MTLoRA Stage-1 is currently supported.")
+        if int(config.MODEL.AGMTLORA.AFFINITY_WARMUP_EPOCHS) < 0:
+            config.MODEL.AGMTLORA.AFFINITY_WARMUP_EPOCHS = int(config.MODEL.AGMTLORA.AFFINITY_COLLECT_EPOCHS)
+        if int(config.MODEL.AGMTLORA.AFFINITY_SCORE_EPOCHS) < 0:
+            raise ValueError("MODEL.AGMTLORA.AFFINITY_SCORE_EPOCHS must be >= 0.")
 
         base_output_dir = config.OUTPUT
         config.MODEL.AGMTLORA.AFFINITY_SAVE_PATH = resolve_artifact_path(
