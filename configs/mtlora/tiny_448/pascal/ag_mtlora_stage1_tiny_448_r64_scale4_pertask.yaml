@@ -36,6 +36,8 @@ MODEL:
   AGMTLORA:
     ENABLED: True
     STAGE: 1
+    DATA_SPLIT_MODE: train_meta_strict
+    META_VAL_RATIO: 0.2
     MAX_GROUPS: 2
     TOTAL_SHARED_RANK_BUDGET: 64
     GROUP_RANK_ALLOCATION: equal_split

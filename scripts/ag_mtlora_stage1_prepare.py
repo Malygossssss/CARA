@@ -50,6 +50,7 @@ def main():
     config.OUTPUT = output_root
     config.MODEL.AGMTLORA.AFFINITY_SAVE_PATH = os.path.join(output_root, "affinity.json")
     config.MODEL.AGMTLORA.GROUPING_SAVE_PATH = os.path.join(output_root, "grouping.json")
+    config.MODEL.AGMTLORA.META_SPLIT_SAVE_PATH = os.path.join(output_root, "meta_split.json")
     config.freeze()
     logger = create_stage1_logger(output_root)
 

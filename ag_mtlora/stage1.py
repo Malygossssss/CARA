@@ -7,6 +7,7 @@ from typing import Dict, Iterable, List, Sequence
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.data import Subset
 from yacs.config import CfgNode as CN
 
 from ag_mtlora.config_utils import (
@@ -18,7 +19,13 @@ from ag_mtlora.config_utils import (
     select_predictor_train_groups,
 )
 from data import build_loader
-from data.mtl_ds import get_tasks_config
+from data.mtl_ds import (
+    get_mtl_dataset,
+    get_mtl_train_dataloader,
+    get_mtl_val_dataloader,
+    get_tasks_config,
+    get_transformations,
+)
 from logger import create_logger
 from models import build_model, build_mtl_model
 from models.lora import mark_only_lora_as_trainable
@@ -154,6 +161,130 @@ def save_partition_csv(ranked_partitions: List[Dict], output_path: str) -> None:
                     json.dumps(item["per_task_scores"], ensure_ascii=False),
                 ]
             )
+
+
+def get_selection_data_split_mode(config: CN, data_split_manifest: Dict = None) -> str:
+    if data_split_manifest is not None and data_split_manifest.get("selection_data_split_mode"):
+        return str(data_split_manifest["selection_data_split_mode"])
+    return str(getattr(config.MODEL.AGMTLORA, "DATA_SPLIT_MODE", "official_val"))
+
+
+def get_selection_train_label(config: CN, data_split_manifest: Dict = None) -> str:
+    if get_selection_data_split_mode(config, data_split_manifest) == "train_meta_strict":
+        return "meta-train"
+    return "train"
+
+
+def get_selection_eval_label(config: CN, data_split_manifest: Dict = None) -> str:
+    if get_selection_data_split_mode(config, data_split_manifest) == "train_meta_strict":
+        return "meta-val"
+    return "official val"
+
+
+def get_effective_meta_split_seed(config: CN) -> int:
+    return int(getattr(config.MODEL.AGMTLORA, "RESOLVED_META_SPLIT_SEED", config.SEED))
+
+
+def get_dataset_sample_ids(dataset) -> List[str]:
+    sample_ids = getattr(dataset, "im_ids", None)
+    if sample_ids is None:
+        raise ValueError("Stage-1 meta split requires datasets to expose stable sample IDs via `im_ids`.")
+    return [str(sample_id) for sample_id in sample_ids]
+
+
+def build_stage1_data_split_manifest(config: CN, logger) -> Dict:
+    selection_data_split_mode = get_selection_data_split_mode(config)
+    meta_split_path = None
+    if selection_data_split_mode != "train_meta_strict":
+        logger.info(
+            "Stage-1 selection data split | mode=%s | train_split=%s | selection_eval=%s",
+            selection_data_split_mode,
+            get_selection_train_label(config),
+            get_selection_eval_label(config),
+        )
+        return {
+            "selection_data_split_mode": selection_data_split_mode,
+            "selection_train_label": get_selection_train_label(config),
+            "selection_eval_label": get_selection_eval_label(config),
+            "meta_split_path": meta_split_path,
+        }
+
+    _, eval_transforms = get_transformations(config.DATA.DBNAME, config.TASKS_CONFIG)
+    full_train_dataset = get_mtl_dataset(config.DATA.DBNAME, config, eval_transforms, split="train")
+    sample_ids = get_dataset_sample_ids(full_train_dataset)
+    num_samples = len(sample_ids)
+    if num_samples < 2:
+        raise ValueError("AG-MTLoRA Stage-1 strict meta split requires at least 2 training samples.")
+
+    meta_val_ratio = float(config.MODEL.AGMTLORA.META_VAL_RATIO)
+    effective_meta_split_seed = get_effective_meta_split_seed(config)
+    shuffled_indices = list(range(num_samples))
+    random.Random(effective_meta_split_seed).shuffle(shuffled_indices)
+    meta_val_count = int(round(num_samples * meta_val_ratio))
+    meta_val_count = min(max(meta_val_count, 1), num_samples - 1)
+    meta_val_indices = sorted(shuffled_indices[:meta_val_count])
+    meta_train_indices = sorted(shuffled_indices[meta_val_count:])
+    meta_split_path = config.MODEL.AGMTLORA.META_SPLIT_SAVE_PATH
+
+    manifest = {
+        "dataset_name": str(config.DATA.DBNAME),
+        "selection_data_split_mode": selection_data_split_mode,
+        "selection_train_label": get_selection_train_label(config),
+        "selection_eval_label": get_selection_eval_label(config),
+        "meta_val_ratio": meta_val_ratio,
+        "effective_meta_split_seed": effective_meta_split_seed,
+        "num_samples": int(num_samples),
+        "meta_train_indices": meta_train_indices,
+        "meta_val_indices": meta_val_indices,
+        "meta_train_ids": [sample_ids[index] for index in meta_train_indices],
+        "meta_val_ids": [sample_ids[index] for index in meta_val_indices],
+        "meta_split_path": meta_split_path,
+    }
+    save_json(manifest, meta_split_path)
+    logger.info(
+        "Stage-1 selection data split prepared | mode=%s | dataset=%s | num_samples=%d | meta_train=%d | meta_val=%d | meta_split_path=%s",
+        selection_data_split_mode,
+        str(config.DATA.DBNAME),
+        int(num_samples),
+        len(meta_train_indices),
+        len(meta_val_indices),
+        meta_split_path,
+    )
+    return manifest
+
+
+def build_stage1_data_loaders(config: CN, data_split_manifest: Dict = None):
+    selection_data_split_mode = get_selection_data_split_mode(config, data_split_manifest)
+    if selection_data_split_mode != "train_meta_strict":
+        return build_loader(config)
+
+    if data_split_manifest is None:
+        raise ValueError("Strict Stage-1 data loading requires a prepared meta split manifest.")
+
+    train_transforms, eval_transforms = get_transformations(config.DATA.DBNAME, config.TASKS_CONFIG)
+    meta_train_dataset_full = get_mtl_dataset(config.DATA.DBNAME, config, train_transforms, split="train")
+    meta_val_dataset_full = get_mtl_dataset(config.DATA.DBNAME, config, eval_transforms, split="train")
+    meta_train_sample_ids = get_dataset_sample_ids(meta_train_dataset_full)
+    meta_val_sample_ids = get_dataset_sample_ids(meta_val_dataset_full)
+    if meta_train_sample_ids != meta_val_sample_ids:
+        raise ValueError("Train-transform and eval-transform views of the train split must preserve sample ordering.")
+
+    meta_train_indices = [int(index) for index in data_split_manifest["meta_train_indices"]]
+    meta_val_indices = [int(index) for index in data_split_manifest["meta_val_indices"]]
+    expected_meta_train_ids = [str(sample_id) for sample_id in data_split_manifest.get("meta_train_ids", [])]
+    expected_meta_val_ids = [str(sample_id) for sample_id in data_split_manifest.get("meta_val_ids", [])]
+    resolved_meta_train_ids = [meta_train_sample_ids[index] for index in meta_train_indices]
+    resolved_meta_val_ids = [meta_train_sample_ids[index] for index in meta_val_indices]
+    if expected_meta_train_ids and expected_meta_train_ids != resolved_meta_train_ids:
+        raise ValueError("Meta-train split manifest does not match the current dataset sample ordering.")
+    if expected_meta_val_ids and expected_meta_val_ids != resolved_meta_val_ids:
+        raise ValueError("Meta-val split manifest does not match the current dataset sample ordering.")
+
+    dataset_train = Subset(meta_train_dataset_full, meta_train_indices)
+    dataset_val = Subset(meta_val_dataset_full, meta_val_indices)
+    data_loader_train = get_mtl_train_dataloader(config, dataset_train)
+    data_loader_val = get_mtl_val_dataloader(config, dataset_val)
+    return dataset_train, dataset_val, data_loader_train, data_loader_val, None
 
 
 def clone_state_dict_to_cpu(model: nn.Module) -> Dict[str, torch.Tensor]:
@@ -304,19 +435,28 @@ def short_train_model(
     init_state_dict: Dict[str, torch.Tensor],
     num_epochs: int,
     device: torch.device,
+    data_split_manifest: Dict = None,
 ):
-    dataset_train, dataset_val, data_loader_train, data_loader_val, _ = build_loader(config)
+    dataset_train, dataset_val, data_loader_train, data_loader_val, _ = build_stage1_data_loaders(
+        config,
+        data_split_manifest=data_split_manifest,
+    )
     model = build_task_model(config, device, logger, init_state_dict=init_state_dict)
     criterion, loss_ft, _ = build_loss_bundle(config)
     optimizer = build_optimizer(config, model)
     num_train_batches = safe_num_batches(data_loader_train)
     num_val_batches = safe_num_batches(data_loader_val)
     train_log_interval = resolve_log_interval(num_train_batches)
+    selection_train_label = get_selection_train_label(config, data_split_manifest)
+    selection_eval_label = get_selection_eval_label(config, data_split_manifest)
+    selection_loss_label = selection_eval_label.replace(" ", "_").replace("-", "_")
 
     logger.info(
-        "Predictor short-train start | tasks=%s | epochs=%d | train_batches=%d | val_batches=%d | output=%s",
+        "Predictor short-train start | tasks=%s | epochs=%d | train_split=%s | selection_eval=%s | train_batches=%d | selection_batches=%d | output=%s",
         list(config.TASKS),
         int(num_epochs),
+        selection_train_label,
+        selection_eval_label,
         num_train_batches,
         num_val_batches,
         config.OUTPUT,
@@ -346,18 +486,19 @@ def short_train_model(
                 extra=f"loss={float(loss.item()):.6f}",
             )
 
-    val_losses = evaluate_task_losses(model, data_loader_val, loss_ft, config.TASKS, device)
+    selection_losses = evaluate_task_losses(model, data_loader_val, loss_ft, config.TASKS, device)
     logger.info(
-        "Predictor short-train finished | tasks=%s | val_losses=%s",
+        "Predictor short-train finished | tasks=%s | %s_losses=%s",
         list(config.TASKS),
-        round_value_map(val_losses),
+        selection_loss_label,
+        round_value_map(selection_losses),
     )
     trained_state = clone_state_dict_to_cpu(model)
     del dataset_train, dataset_val, data_loader_train, data_loader_val
     del optimizer, criterion, loss_ft, model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    return trained_state, val_losses
+    return trained_state, selection_losses
 
 
 def get_shared_ta_parameters(model: nn.Module):
@@ -407,9 +548,12 @@ def build_pseudo_update(flat_grad: torch.Tensor, optimizer) -> torch.Tensor:
     return lr * (flat_grad + momentum * momentum_buffer)
 
 
-def warmup_and_collect_affinity(config: CN, logger, working_dir: str):
+def warmup_and_collect_affinity(config: CN, logger, working_dir: str, data_split_manifest: Dict = None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dataset_train, dataset_val, data_loader_train, data_loader_val, _ = build_loader(config)
+    dataset_train, dataset_val, data_loader_train, data_loader_val, _ = build_stage1_data_loaders(
+        config,
+        data_split_manifest=data_split_manifest,
+    )
     model = build_task_model(config, device, logger)
     criterion, loss_ft, _ = build_loss_bundle(config)
     optimizer = build_optimizer(config, model)
@@ -418,12 +562,19 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str):
     train_log_interval = resolve_log_interval(num_train_batches)
     warmup_epochs = get_affinity_warmup_epochs(config)
     affinity_score_epochs = get_affinity_score_epochs(config)
+    selection_train_label = get_selection_train_label(config, data_split_manifest)
+    selection_eval_label = get_selection_eval_label(config, data_split_manifest)
+    selection_loss_label = selection_eval_label.replace(" ", "_").replace("-", "_")
+    selection_data_split_mode = get_selection_data_split_mode(config, data_split_manifest)
+    meta_split_path = None if data_split_manifest is None else data_split_manifest.get("meta_split_path")
 
     logger.info(
-        "Stage-1 Step A start | tasks=%s | warmup_epochs=%d | affinity_score_epochs=%d | train_batches=%d | val_batches=%d | output=%s",
+        "Stage-1 Step A start | tasks=%s | warmup_epochs=%d | affinity_score_epochs=%d | train_split=%s | selection_eval=%s | train_batches=%d | selection_batches=%d | output=%s",
         list(config.TASKS),
         warmup_epochs,
         affinity_score_epochs,
+        selection_train_label,
+        selection_eval_label,
         num_train_batches,
         num_val_batches,
         working_dir,
@@ -465,13 +616,16 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str):
                 "tasks": list(config.TASKS),
                 "affinity_warmup_epochs": warmup_epochs,
                 "affinity_score_epochs": affinity_score_epochs,
+                "selection_data_split_mode": selection_data_split_mode,
+                "meta_split_path": meta_split_path,
             },
         },
         warmup_checkpoint_path,
     )
     logger.info(
-        "Warmup checkpoint saved to %s | warmup_validation_losses=%s",
+        "Warmup checkpoint saved to %s | %s_losses=%s",
         warmup_checkpoint_path,
+        selection_loss_label,
         round_value_map(warmup_validation_losses),
     )
 
@@ -569,14 +723,17 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str):
                 "tasks": list(config.TASKS),
                 "affinity_warmup_epochs": warmup_epochs,
                 "affinity_score_epochs": affinity_score_epochs,
+                "selection_data_split_mode": selection_data_split_mode,
+                "meta_split_path": meta_split_path,
             },
         },
         post_affinity_checkpoint_path,
     )
     logger.info(
-        "Stage-1 Step A finished | num_affinity_epochs=%d | num_batches_per_epoch=%s | post_affinity_validation_losses=%s | post_affinity_checkpoint=%s",
+        "Stage-1 Step A finished | num_affinity_epochs=%d | num_batches_per_epoch=%s | %s_losses=%s | post_affinity_checkpoint=%s",
         affinity_score_epochs,
         num_batches_per_epoch,
+        selection_loss_label,
         round_value_map(post_affinity_validation_losses),
         post_affinity_checkpoint_path,
     )
@@ -599,6 +756,9 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str):
         "num_batches_per_epoch": num_batches_per_epoch,
         "num_affinity_epochs": affinity_score_epochs,
         "validation_losses": post_affinity_validation_losses,
+        "selection_data_split_mode": selection_data_split_mode,
+        "selection_eval_label": selection_eval_label,
+        "meta_split_path": meta_split_path,
         "num_batches": int(sum(num_batches_per_epoch)),
     }
 
@@ -631,6 +791,7 @@ def collect_predictor_training_targets(
     baseline_state_dict: Dict[str, torch.Tensor],
     train_groups: Sequence[Sequence[str]],
     working_dir: str,
+    data_split_manifest: Dict = None,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     singleton_losses = {}
@@ -658,6 +819,7 @@ def collect_predictor_training_targets(
             baseline_state_dict,
             task_config.MODEL.AGMTLORA.PREDICTOR_GROUP_TRAIN_EPOCHS,
             device,
+            data_split_manifest=data_split_manifest,
         )
         singleton_losses[task] = float(val_losses[task])
         predictor_targets[group_to_key([task])] = {task: 0.0}
@@ -681,6 +843,7 @@ def collect_predictor_training_targets(
             baseline_state_dict,
             group_config.MODEL.AGMTLORA.PREDICTOR_GROUP_TRAIN_EPOCHS,
             device,
+            data_split_manifest=data_split_manifest,
         )
         predictor_targets[group_key] = {}
         for task in group:
@@ -878,8 +1041,17 @@ def create_resolved_training_config(base_config: CN, grouping_json_path: str, re
 def run_stage1_pipeline(config: CN, output_root: str, logger):
     mkdir_if_missing(output_root)
     logger.info("AG-MTLoRA Stage-1 pipeline started | output_root=%s", output_root)
+    data_split_manifest = build_stage1_data_split_manifest(config, logger)
+    selection_data_split_mode = get_selection_data_split_mode(config, data_split_manifest)
+    selection_eval_label = get_selection_eval_label(config, data_split_manifest)
+    meta_split_path = None if data_split_manifest is None else data_split_manifest.get("meta_split_path")
 
-    affinity_result = warmup_and_collect_affinity(config, logger, output_root)
+    affinity_result = warmup_and_collect_affinity(
+        config,
+        logger,
+        output_root,
+        data_split_manifest=data_split_manifest,
+    )
     directed_affinity = affinity_result["directed_affinity"]
     symmetric_affinity = affinity_result["symmetric_affinity"]
     affinity_warmup_epochs = get_affinity_warmup_epochs(config)
@@ -895,6 +1067,9 @@ def run_stage1_pipeline(config: CN, output_root: str, logger):
     save_json(
         {
             "tasks": list(config.TASKS),
+            "selection_data_split_mode": selection_data_split_mode,
+            "selection_eval_label": selection_eval_label,
+            "meta_split_path": meta_split_path,
             "directed_affinity": directed_affinity.tolist(),
             "num_affinity_epochs": int(affinity_result["num_affinity_epochs"]),
             "num_batches_per_epoch": list(affinity_result["num_batches_per_epoch"]),
@@ -910,6 +1085,9 @@ def run_stage1_pipeline(config: CN, output_root: str, logger):
     save_json(
         {
             "tasks": list(config.TASKS),
+            "selection_data_split_mode": selection_data_split_mode,
+            "selection_eval_label": selection_eval_label,
+            "meta_split_path": meta_split_path,
             "affinity_warmup_epochs": affinity_warmup_epochs,
             "affinity_score_epochs": affinity_score_epochs,
             "num_batches_per_epoch": list(affinity_result["num_batches_per_epoch"]),
@@ -923,6 +1101,9 @@ def run_stage1_pipeline(config: CN, output_root: str, logger):
         save_json(
             {
                 "tasks": list(config.TASKS),
+                "selection_data_split_mode": selection_data_split_mode,
+                "selection_eval_label": selection_eval_label,
+                "meta_split_path": meta_split_path,
                 "symmetric_affinity": symmetric_affinity.tolist(),
             },
             affinity_sym_json_path,
@@ -934,7 +1115,16 @@ def run_stage1_pipeline(config: CN, output_root: str, logger):
     group_proxy, group_proxy_rows = build_group_proxy(directed_affinity, config.TASKS, candidate_groups)
     group_proxy_json_path = os.path.join(output_root, "group_proxy.json")
     group_proxy_csv_path = os.path.join(output_root, "group_proxy.csv")
-    save_json({"tasks": list(config.TASKS), "group_proxy": group_proxy}, group_proxy_json_path)
+    save_json(
+        {
+            "tasks": list(config.TASKS),
+            "selection_data_split_mode": selection_data_split_mode,
+            "selection_eval_label": selection_eval_label,
+            "meta_split_path": meta_split_path,
+            "group_proxy": group_proxy,
+        },
+        group_proxy_json_path,
+    )
     save_group_task_rows(group_proxy_rows, group_proxy_csv_path, "proxy")
 
     predictor_train_groups = select_predictor_train_groups(
@@ -953,12 +1143,16 @@ def run_stage1_pipeline(config: CN, output_root: str, logger):
         affinity_result["post_affinity_state_dict"],
         predictor_train_groups,
         output_root,
+        data_split_manifest=data_split_manifest,
     )
     predictor_train_groups_json = os.path.join(output_root, "predictor_train_groups.json")
     predictor_train_groups_csv = os.path.join(output_root, "predictor_train_groups.csv")
     save_json(
         {
             "tasks": list(config.TASKS),
+            "selection_data_split_mode": selection_data_split_mode,
+            "selection_eval_label": selection_eval_label,
+            "meta_split_path": meta_split_path,
             "train_groups": predictor_train_groups,
             "singleton_val_losses": singleton_losses,
             "gt_predicted_gains": predictor_targets,
@@ -1027,9 +1221,36 @@ def run_stage1_pipeline(config: CN, output_root: str, logger):
     initial_predictions_json = os.path.join(output_root, "initial_predictions.json")
     residual_predictions_json = os.path.join(output_root, "residual_predictions.json")
     final_predictions_json = os.path.join(output_root, "final_predictions.json")
-    save_json({"tasks": list(config.TASKS), "initial_predictions": initial_predictions}, initial_predictions_json)
-    save_json({"tasks": list(config.TASKS), "residual_predictions": residual_predictions}, residual_predictions_json)
-    save_json({"tasks": list(config.TASKS), "final_predictions": final_predictions}, final_predictions_json)
+    save_json(
+        {
+            "tasks": list(config.TASKS),
+            "selection_data_split_mode": selection_data_split_mode,
+            "selection_eval_label": selection_eval_label,
+            "meta_split_path": meta_split_path,
+            "initial_predictions": initial_predictions,
+        },
+        initial_predictions_json,
+    )
+    save_json(
+        {
+            "tasks": list(config.TASKS),
+            "selection_data_split_mode": selection_data_split_mode,
+            "selection_eval_label": selection_eval_label,
+            "meta_split_path": meta_split_path,
+            "residual_predictions": residual_predictions,
+        },
+        residual_predictions_json,
+    )
+    save_json(
+        {
+            "tasks": list(config.TASKS),
+            "selection_data_split_mode": selection_data_split_mode,
+            "selection_eval_label": selection_eval_label,
+            "meta_split_path": meta_split_path,
+            "final_predictions": final_predictions,
+        },
+        final_predictions_json,
+    )
     save_predictor_value_csv(initial_predictions, os.path.join(output_root, "initial_predictions.csv"))
     save_predictor_value_csv(residual_predictions, os.path.join(output_root, "residual_predictions.csv"))
     save_predictor_value_csv(final_predictions, os.path.join(output_root, "final_predictions.csv"))
@@ -1051,6 +1272,9 @@ def run_stage1_pipeline(config: CN, output_root: str, logger):
     save_json(
         {
             "tasks": list(config.TASKS),
+            "selection_data_split_mode": selection_data_split_mode,
+            "selection_eval_label": selection_eval_label,
+            "meta_split_path": meta_split_path,
             "search_objective": str(config.MODEL.AGMTLORA.SEARCH_OBJECTIVE),
             "ranked_partitions": ranked_partitions,
         },
@@ -1075,6 +1299,9 @@ def run_stage1_pipeline(config: CN, output_root: str, logger):
         "partition_score": float(best_partition["partition_score"]),
         "group_shared_ranks": resolved_group_ranks,
         "search_objective": str(config.MODEL.AGMTLORA.SEARCH_OBJECTIVE),
+        "selection_data_split_mode": selection_data_split_mode,
+        "selection_eval_label": selection_eval_label,
+        "meta_split_path": meta_split_path,
         "affinity_path": affinity_json_path,
         "final_predictions_path": final_predictions_json,
         "warmup_checkpoint": affinity_result["warmup_checkpoint_path"],
@@ -1111,6 +1338,7 @@ def run_stage1_pipeline(config: CN, output_root: str, logger):
         "resolved_config_path": resolved_config_path,
         "warmup_checkpoint_path": affinity_result["warmup_checkpoint_path"],
         "post_affinity_checkpoint_path": affinity_result["post_affinity_checkpoint_path"],
+        "meta_split_path": meta_split_path,
     }
 
 

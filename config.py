@@ -356,6 +356,11 @@ _C.MODEL.AGMTLORA.AFFINITY_WARMUP_EPOCHS = -1
 _C.MODEL.AGMTLORA.AFFINITY_SCORE_EPOCHS = 50
 _C.MODEL.AGMTLORA.AFFINITY_SAVE_PATH = ''
 _C.MODEL.AGMTLORA.GROUPING_SAVE_PATH = ''
+_C.MODEL.AGMTLORA.DATA_SPLIT_MODE = 'train_meta_strict'  # train_meta_strict, official_val
+_C.MODEL.AGMTLORA.META_VAL_RATIO = 0.2
+_C.MODEL.AGMTLORA.META_SPLIT_SEED = -1
+_C.MODEL.AGMTLORA.META_SPLIT_SAVE_PATH = ''
+_C.MODEL.AGMTLORA.RESOLVED_META_SPLIT_SEED = 0
 _C.MODEL.AGMTLORA.SEARCH_OBJECTIVE = 'mean_final_predicted_gain'
 _C.MODEL.AGMTLORA.PREDICTOR_TRAIN_GROUP_BUDGET = 0
 _C.MODEL.AGMTLORA.PREDICTOR_TRAIN_GROUP_STRATEGY = 'all_singletons+all_pairs+random_higher_order'
@@ -627,6 +632,14 @@ def update_config(config, args):
             raise ValueError("AGMTLoRA requires MODEL.MTLORA.ENABLED=True.")
         if int(config.MODEL.AGMTLORA.STAGE) != 1:
             raise ValueError("Only AG-MTLoRA Stage-1 is currently supported.")
+        if str(config.MODEL.AGMTLORA.DATA_SPLIT_MODE) not in {"train_meta_strict", "official_val"}:
+            raise ValueError("MODEL.AGMTLORA.DATA_SPLIT_MODE must be one of {'train_meta_strict', 'official_val'}.")
+        if not 0.0 < float(config.MODEL.AGMTLORA.META_VAL_RATIO) < 1.0:
+            raise ValueError("MODEL.AGMTLORA.META_VAL_RATIO must satisfy 0 < META_VAL_RATIO < 1.")
+        if int(config.MODEL.AGMTLORA.META_SPLIT_SEED) < 0:
+            config.MODEL.AGMTLORA.RESOLVED_META_SPLIT_SEED = int(config.SEED)
+        else:
+            config.MODEL.AGMTLORA.RESOLVED_META_SPLIT_SEED = int(config.MODEL.AGMTLORA.META_SPLIT_SEED)
         if int(config.MODEL.AGMTLORA.AFFINITY_WARMUP_EPOCHS) < 0:
             config.MODEL.AGMTLORA.AFFINITY_WARMUP_EPOCHS = int(config.MODEL.AGMTLORA.AFFINITY_COLLECT_EPOCHS)
         if int(config.MODEL.AGMTLORA.AFFINITY_SCORE_EPOCHS) < 0:
@@ -642,6 +655,11 @@ def update_config(config, args):
             base_output_dir,
             config.MODEL.AGMTLORA.GROUPING_SAVE_PATH,
             "ag_mtlora_stage1/grouping.json",
+        )
+        config.MODEL.AGMTLORA.META_SPLIT_SAVE_PATH = resolve_artifact_path(
+            base_output_dir,
+            config.MODEL.AGMTLORA.META_SPLIT_SAVE_PATH,
+            "ag_mtlora_stage1/meta_split.json",
         )
         if config.MODEL.AGMTLORA.GROUPING_JSON:
             config.MODEL.AGMTLORA.GROUPING_JSON = resolve_artifact_path(

@@ -702,26 +702,7 @@ def get_mtl_train_dataset(db_name, config, transforms):
     """ Return the train dataset """
 
     print('Preparing train loader for db: {}'.format(db_name))
-
-    if db_name == 'NYUD':
-        database = NYUD_MT(root=config.DATA.DATA_PATH, split='train', transform=transforms,
-                           do_edge='edge' in config.TASKS,
-                           do_semseg='semseg' in config.TASKS,
-                           do_normals='normals' in config.TASKS,
-                           do_depth='depth' in config.TASKS, overfit=False)
-    elif db_name == 'PASCALContext':
-        database = PASCALContext(root=config.DATA.DATA_PATH, split=['train'], transform=transforms, retname=True,
-                                 do_semseg='semseg' in config.TASKS,
-                                 do_edge='edge' in config.TASKS,
-                                 do_normals='normals' in config.TASKS,
-                                 do_sal='sal' in config.TASKS,
-                                 do_human_parts='human_parts' in config.TASKS,
-                                 overfit=False)
-    else:
-        raise NotImplemented(
-            "train_db_name: Choose among PASCALContext and NYUD")
-
-    return database
+    return get_mtl_dataset(db_name, config, transforms, split='train')
 
 
 def get_tasks_config(db_name, task_list, img_size):
@@ -885,27 +866,7 @@ def get_mtl_val_dataset(db_name, config, transforms):
     """ Return the validation dataset """
 
     print('Preparing val loader for db: {}'.format(db_name))
-
-    if db_name == 'NYUD':
-        database = NYUD_MT(root=config.DATA.DATA_PATH, split='val', transform=transforms,
-                           do_edge='edge' in config.TASKS,
-                           do_semseg='semseg' in config.TASKS,
-                           do_normals='normals' in config.TASKS,
-                           do_depth='depth' in config.TASKS, overfit=False)
-    elif db_name == 'PASCALContext':
-        database = PASCALContext(root=config.DATA.DATA_PATH, split=['val'], transform=transforms, retname=True,
-                                 do_semseg='semseg' in config.TASKS,
-                                 do_edge='edge' in config.TASKS,
-                                 do_normals='normals' in config.TASKS,
-                                 do_sal='sal' in config.TASKS,
-                                 do_human_parts='human_parts' in config.TASKS,
-                                 overfit=False)
-
-    else:
-        raise NotImplemented(
-            "test_db_name: Choose among PASCALContext and NYUD")
-
-    return database
+    return get_mtl_dataset(db_name, config, transforms, split='val')
 
 
 def get_mtl_val_dataloader(config, dataset):
@@ -923,6 +884,15 @@ def get_mtl_eval_dataset(db_name, config, transforms, split='val'):
         raise ValueError(f"Unsupported eval split: {split}")
 
     print(f'Preparing {split} loader for db: {db_name}')
+    return get_mtl_dataset(db_name, config, transforms, split=split)
+
+
+def get_mtl_dataset(db_name, config, transforms, split='train'):
+    """Return an MTL dataset for the requested split."""
+
+    split = str(split)
+    if split not in {'train', 'val', 'test'}:
+        raise ValueError(f"Unsupported MTL split: {split}")
 
     if db_name == 'NYUD':
         database = NYUD_MT(root=config.DATA.DATA_PATH, split=split, transform=transforms,
