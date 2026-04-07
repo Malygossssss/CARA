@@ -62,7 +62,7 @@ def main():
     logger.info("Running AG-MTLoRA Stage-1 preparation with config:\n%s", config.dump())
     logger.info("CLI args: %s", json.dumps(vars(args), ensure_ascii=False))
 
-    artifacts = run_stage1_pipeline(config, output_root, logger)
+    artifacts = run_stage1_pipeline(config, output_root, logger, base_cfg_path=os.path.abspath(args.cfg))
     logger.info("AG-MTLoRA Stage-1 preparation finished.")
     logger.info(json.dumps(artifacts, indent=2, ensure_ascii=False))
 

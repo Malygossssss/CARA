@@ -1221,19 +1221,27 @@ def run_partition_search(tasks: Sequence[str], final_predictions: Dict[str, Dict
     return ranked_results
 
 
-def create_resolved_training_config(base_config: CN, grouping_json_path: str, resolved_group_ranks: List[List[int]]) -> CN:
-    resolved_config = base_config.clone()
-    resolved_config.defrost()
+def create_resolved_training_config(base_cfg_path: str, grouping_json_path: str, resolved_group_ranks: List[List[int]]) -> CN:
+    if not base_cfg_path:
+        raise ValueError("AG-MTLoRA Stage-1 requires the original --cfg path to build a reusable training override.")
+
+    resolved_config = CN(new_allowed=True)
+    resolved_config.BASE = [os.path.abspath(base_cfg_path)]
+    resolved_config.MODEL = CN(new_allowed=True)
+    resolved_config.MODEL.AGMTLORA = CN(new_allowed=True)
     resolved_config.MODEL.AGMTLORA.ENABLED = True
     resolved_config.MODEL.AGMTLORA.STAGE = 1
     resolved_config.MODEL.AGMTLORA.GROUPING_SOURCE = "fixed_json"
     resolved_config.MODEL.AGMTLORA.GROUPING_JSON = os.path.abspath(grouping_json_path)
-    resolved_config.MODEL.AGMTLORA.GROUP_SHARED_RANKS = resolved_group_ranks
+    resolved_config.MODEL.AGMTLORA.GROUP_SHARED_RANKS = [
+        [int(rank) for rank in stage_ranks]
+        for stage_ranks in resolved_group_ranks
+    ]
     resolved_config.freeze()
     return resolved_config
 
 
-def run_stage1_pipeline(config: CN, output_root: str, logger):
+def run_stage1_pipeline(config: CN, output_root: str, logger, base_cfg_path: str):
     mkdir_if_missing(output_root)
     logger.info("AG-MTLoRA Stage-1 pipeline started | output_root=%s", output_root)
     data_split_manifest = build_stage1_data_split_manifest(config, logger)
@@ -1524,12 +1532,16 @@ def run_stage1_pipeline(config: CN, output_root: str, logger):
     save_json(grouping_payload, grouping_json_path)
     logger.info("Grouping saved to %s", grouping_json_path)
 
-    resolved_config = create_resolved_training_config(config, grouping_json_path, resolved_group_ranks)
+    resolved_config = create_resolved_training_config(base_cfg_path, grouping_json_path, resolved_group_ranks)
     resolved_config_path = os.path.join(output_root, "resolved_agmtlora_config.yaml")
+    resolved_runtime_snapshot_path = os.path.join(output_root, "resolved_agmtlora_runtime_snapshot.yaml")
     mkdir_if_missing(os.path.dirname(resolved_config_path))
     with open(resolved_config_path, "w", encoding="utf-8") as handle:
         handle.write(resolved_config.dump())
+    with open(resolved_runtime_snapshot_path, "w", encoding="utf-8") as handle:
+        handle.write(config.dump())
     logger.info("Resolved AG-MTLoRA training config saved to %s", resolved_config_path)
+    logger.info("Resolved AG-MTLoRA runtime snapshot saved to %s", resolved_runtime_snapshot_path)
 
     return {
         "affinity_json_path": affinity_json_path,
@@ -1545,6 +1557,7 @@ def run_stage1_pipeline(config: CN, output_root: str, logger):
         "partition_results_csv": partition_results_csv,
         "grouping_json_path": grouping_json_path,
         "resolved_config_path": resolved_config_path,
+        "resolved_runtime_snapshot_path": resolved_runtime_snapshot_path,
         "warmup_checkpoint_path": affinity_result["warmup_checkpoint_path"],
         "post_affinity_checkpoint_path": affinity_result["post_affinity_checkpoint_path"],
         "meta_split_path": meta_split_path,

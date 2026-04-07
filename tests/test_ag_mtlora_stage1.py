@@ -5,6 +5,7 @@ import unittest
 from unittest import mock
 
 import numpy as np
+import yaml
 from yacs.config import CfgNode as CN
 
 import ag_mtlora.stage1 as stage1
@@ -183,6 +184,25 @@ class Stage1MetaSplitTest(unittest.TestCase):
             self.assertEqual(list(dataset_val.indices), [0])
             self.assertEqual(data_loader_train, ("train_loader", [1, 2]))
             self.assertEqual(data_loader_val, ("val_loader", [0]))
+
+    def test_create_resolved_training_config_is_schema_safe_and_base_backed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_cfg_path = os.path.join(tmpdir, "base.yaml")
+            grouping_json_path = os.path.join(tmpdir, "grouping.json")
+            with open(base_cfg_path, "w", encoding="utf-8") as handle:
+                handle.write("MODEL:\n  NAME: test\n")
+
+            resolved = stage1.create_resolved_training_config(
+                base_cfg_path,
+                grouping_json_path,
+                [[32, 32], [16, 16]],
+            )
+
+            payload = yaml.safe_load(resolved.dump())
+            self.assertEqual(payload["BASE"], [os.path.abspath(base_cfg_path)])
+            self.assertEqual(payload["MODEL"]["AGMTLORA"]["GROUPING_SOURCE"], "fixed_json")
+            self.assertEqual(payload["MODEL"]["AGMTLORA"]["GROUPING_JSON"], os.path.abspath(grouping_json_path))
+            self.assertEqual(payload["MODEL"]["AGMTLORA"]["GROUP_SHARED_RANKS"], [[32, 32], [16, 16]])
 
     def test_build_stage1_data_loaders_legacy_mode_uses_existing_build_loader(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -397,9 +417,15 @@ class Stage1MetaSplitTest(unittest.TestCase):
             ), mock.patch(
                 "ag_mtlora.stage1.save_partition_csv"
             ):
-                artifacts = stage1.run_stage1_pipeline(config, tmpdir, logger)
+                artifacts = stage1.run_stage1_pipeline(
+                    config,
+                    tmpdir,
+                    logger,
+                    base_cfg_path=os.path.join(tmpdir, "base_config.yaml"),
+                )
 
             self.assertEqual(artifacts["meta_split_path"], manifest["meta_split_path"])
+            self.assertTrue(os.path.exists(artifacts["resolved_runtime_snapshot_path"]))
             mocked_manifest.assert_called_once_with(config, logger)
             mocked_warmup.assert_called_once()
             self.assertIs(mocked_warmup.call_args.kwargs["data_split_manifest"], manifest)
