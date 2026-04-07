@@ -38,14 +38,18 @@ def parse_args():
     parser.add_argument("--pascal", type=str)
     parser.add_argument("--decoder_map", type=str)
     parser.add_argument("--skip_decoder", action="store_true")
+    parser.add_argument("--resume-stage1-dir", type=str, help="Resume a previous Stage-1 output directory in-place.")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     config = get_config(args)
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_root = os.path.join(config.OUTPUT, "ag_mtlora_stage1_prepare", f"run_{timestamp}")
+    if args.resume_stage1_dir:
+        output_root = os.path.abspath(args.resume_stage1_dir)
+    else:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_root = os.path.join(config.OUTPUT, "ag_mtlora_stage1_prepare", f"run_{timestamp}")
     config.defrost()
     config.OUTPUT = output_root
     config.MODEL.AGMTLORA.AFFINITY_SAVE_PATH = os.path.join(output_root, "affinity.json")

@@ -705,6 +705,25 @@ def get_mtl_train_dataset(db_name, config, transforms):
     return get_mtl_dataset(db_name, config, transforms, split='train')
 
 
+def get_mtl_split_sample_ids(db_name, root, split='train'):
+    """Return stable sample IDs for the requested MTL split without task-specific filtering."""
+
+    split = str(split)
+    if split not in {'train', 'val', 'test'}:
+        raise ValueError(f"Unsupported MTL split: {split}")
+
+    if db_name == 'NYUD':
+        split_file = os.path.join(root, 'gt_sets', split + '.txt')
+    elif db_name == 'PASCALContext':
+        split_file = os.path.join(root, 'ImageSets', 'Context', split + '.txt')
+    else:
+        raise NotImplemented("train_db_name: Choose among PASCALContext and NYUD")
+
+    with open(split_file, 'r', encoding='utf-8') as handle:
+        sample_ids = [line.strip() for line in handle if line.strip()]
+    return sample_ids
+
+
 def get_tasks_config(db_name, task_list, img_size):
     """ 
         Return a dictionary with task information. 

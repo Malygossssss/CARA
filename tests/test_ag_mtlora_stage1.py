@@ -71,14 +71,27 @@ def build_stage1_config(tmpdir, split_mode="train_meta_strict"):
 
 
 class Stage1MetaSplitTest(unittest.TestCase):
+    def test_parse_predictor_progress_from_log_recovers_singletons_and_groups(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = os.path.join(tmpdir, "log_rank0.txt")
+            with open(log_path, "w", encoding="utf-8") as handle:
+                handle.write("Predictor target collected | singleton task=semseg | val_loss=1.234500\n")
+                handle.write("Predictor target collected | group=['semseg', 'normals'] | gains={'semseg': 0.1, 'normals': 0.2}\n")
+
+            predictor_targets, singleton_losses = stage1.parse_predictor_progress_from_log(log_path)
+
+            self.assertEqual(singleton_losses, {"semseg": 1.2345})
+            self.assertEqual(predictor_targets["semseg"], {"semseg": 0.0})
+            self.assertEqual(predictor_targets["semseg|normals"], {"semseg": 0.1, "normals": 0.2})
+
     def test_build_stage1_data_split_manifest_is_deterministic_and_persists_ids(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config = build_stage1_config(tmpdir)
             sample_ids = [f"sample_{idx}" for idx in range(10)]
 
-            with mock.patch("ag_mtlora.stage1.get_transformations", return_value=("train_tf", "eval_tf")), mock.patch(
-                "ag_mtlora.stage1.get_mtl_dataset",
-                side_effect=lambda db_name, cfg, transforms, split: FakeDataset(sample_ids),
+            with mock.patch(
+                "ag_mtlora.stage1.get_mtl_split_sample_ids",
+                return_value=sample_ids,
             ):
                 logger = mock.Mock()
                 manifest_a = stage1.build_stage1_data_split_manifest(config, logger)
@@ -138,6 +151,39 @@ class Stage1MetaSplitTest(unittest.TestCase):
             mocked_train_loader.assert_called_once()
             mocked_val_loader.assert_called_once()
 
+    def test_build_stage1_data_loaders_projects_manifest_ids_for_filtered_task_dataset(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = build_stage1_config(tmpdir)
+            manifest = {
+                "selection_data_split_mode": "train_meta_strict",
+                "meta_train_indices": [0, 2, 4, 5],
+                "meta_val_indices": [1, 3],
+                "meta_train_ids": ["sample_0", "sample_2", "sample_4", "sample_5"],
+                "meta_val_ids": ["sample_1", "sample_3"],
+                "meta_split_path": os.path.join(tmpdir, "meta_split.json"),
+            }
+            filtered_sample_ids = ["sample_1", "sample_2", "sample_5"]
+
+            with mock.patch("ag_mtlora.stage1.get_transformations", return_value=("train_tf", "eval_tf")), mock.patch(
+                "ag_mtlora.stage1.get_mtl_dataset",
+                side_effect=lambda db_name, cfg, transforms, split: FakeDataset(filtered_sample_ids),
+            ), mock.patch(
+                "ag_mtlora.stage1.get_mtl_train_dataloader",
+                side_effect=lambda cfg, dataset: ("train_loader", list(dataset.indices)),
+            ), mock.patch(
+                "ag_mtlora.stage1.get_mtl_val_dataloader",
+                side_effect=lambda cfg, dataset: ("val_loader", list(dataset.indices)),
+            ):
+                dataset_train, dataset_val, data_loader_train, data_loader_val, _ = stage1.build_stage1_data_loaders(
+                    config,
+                    data_split_manifest=manifest,
+                )
+
+            self.assertEqual(list(dataset_train.indices), [1, 2])
+            self.assertEqual(list(dataset_val.indices), [0])
+            self.assertEqual(data_loader_train, ("train_loader", [1, 2]))
+            self.assertEqual(data_loader_val, ("val_loader", [0]))
+
     def test_build_stage1_data_loaders_legacy_mode_uses_existing_build_loader(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config = build_stage1_config(tmpdir, split_mode="official_val")
@@ -196,6 +242,50 @@ class Stage1MetaSplitTest(unittest.TestCase):
             self.assertAlmostEqual(predictor_targets["task_a|task_b"]["task_b"], 0.4)
             self.assertEqual(mocked_short_train.call_count, 3)
             self.assertTrue(all(call.kwargs["data_split_manifest"] is manifest for call in mocked_short_train.call_args_list))
+
+    def test_collect_predictor_training_targets_uses_cached_log_progress(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = os.path.join(tmpdir, "log_rank0.txt")
+            with open(log_path, "w", encoding="utf-8") as handle:
+                handle.write("Predictor target collected | singleton task=task_a | val_loss=1.000000\n")
+
+            base_config = CN()
+            base_config.TASKS = ["task_a", "task_b"]
+            manifest = {"selection_data_split_mode": "train_meta_strict", "meta_split_path": os.path.join(tmpdir, "meta_split.json")}
+
+            def make_group_config(group):
+                cfg = CN()
+                cfg.TASKS = list(group)
+                cfg.MODEL = CN()
+                cfg.MODEL.AGMTLORA = CN()
+                cfg.MODEL.AGMTLORA.PREDICTOR_GROUP_TRAIN_EPOCHS = 1
+                cfg.OUTPUT = tmpdir
+                return cfg
+
+            with mock.patch(
+                "ag_mtlora.stage1.rebuild_task_config",
+                side_effect=lambda config, group, output_dir=None: make_group_config(group),
+            ), mock.patch(
+                "ag_mtlora.stage1.short_train_model",
+                side_effect=[
+                    (None, {"task_b": 2.0}),
+                    (None, {"task_a": 0.8, "task_b": 1.5}),
+                ],
+            ) as mocked_short_train:
+                predictor_targets, singleton_losses = stage1.collect_predictor_training_targets(
+                    base_config,
+                    mock.Mock(),
+                    baseline_state_dict={},
+                    train_groups=[["task_a"], ["task_b"], ["task_a", "task_b"]],
+                    working_dir=tmpdir,
+                    data_split_manifest=manifest,
+                )
+
+            self.assertEqual(singleton_losses["task_a"], 1.0)
+            self.assertEqual(singleton_losses["task_b"], 2.0)
+            self.assertEqual(mocked_short_train.call_count, 2)
+            self.assertEqual(predictor_targets["task_a"], {"task_a": 0.0})
+            self.assertEqual(predictor_targets["task_b"], {"task_b": 0.0})
 
     def test_run_stage1_pipeline_records_split_metadata_and_returns_meta_split_path(self):
         with tempfile.TemporaryDirectory() as tmpdir:

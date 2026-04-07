@@ -1,7 +1,9 @@
+import ast
 import csv
 import json
 import os
 import random
+import re
 from typing import Dict, Iterable, List, Sequence
 
 import numpy as np
@@ -21,6 +23,7 @@ from ag_mtlora.config_utils import (
 from data import build_loader
 from data.mtl_ds import (
     get_mtl_dataset,
+    get_mtl_split_sample_ids,
     get_mtl_train_dataloader,
     get_mtl_val_dataloader,
     get_tasks_config,
@@ -42,6 +45,8 @@ DEFAULT_TASK_LOSS_WEIGHTS = {
     "edge": 50.0,
     "normals": 10.0,
 }
+
+PREDICTOR_PROGRESS_FILENAME = "predictor_progress.json"
 
 
 def group_to_key(group: Sequence[str]) -> str:
@@ -104,6 +109,11 @@ def save_json(payload: Dict, output_path: str) -> None:
     mkdir_if_missing(os.path.dirname(output_path))
     with open(output_path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, ensure_ascii=False)
+
+
+def load_json(output_path: str) -> Dict:
+    with open(output_path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 def save_matrix_csv(tasks: Sequence[str], matrix: np.ndarray, output_path: str) -> None:
@@ -192,6 +202,147 @@ def get_dataset_sample_ids(dataset) -> List[str]:
     return [str(sample_id) for sample_id in sample_ids]
 
 
+def get_predictor_progress_path(working_dir: str) -> str:
+    return os.path.join(working_dir, PREDICTOR_PROGRESS_FILENAME)
+
+
+def parse_predictor_progress_from_log(log_path: str):
+    singleton_losses = {}
+    predictor_targets = {}
+    if not os.path.exists(log_path):
+        return predictor_targets, singleton_losses
+
+    singleton_pattern = re.compile(r"Predictor target collected \| singleton task=(?P<task>[^|]+) \| val_loss=(?P<loss>[-+0-9.eE]+)")
+    group_pattern = re.compile(r"Predictor target collected \| group=(?P<group>\[.*?\]) \| gains=(?P<gains>\{.*\})")
+
+    with open(log_path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            singleton_match = singleton_pattern.search(line)
+            if singleton_match:
+                task = singleton_match.group("task").strip()
+                singleton_losses[task] = float(singleton_match.group("loss"))
+                predictor_targets[group_to_key([task])] = {task: 0.0}
+                continue
+
+            group_match = group_pattern.search(line)
+            if not group_match:
+                continue
+            try:
+                group = list(ast.literal_eval(group_match.group("group")))
+                gains = dict(ast.literal_eval(group_match.group("gains")))
+            except (SyntaxError, ValueError):
+                continue
+            predictor_targets[group_to_key(group)] = {
+                str(task): float(value) for task, value in gains.items()
+            }
+
+    return predictor_targets, singleton_losses
+
+
+def load_predictor_progress(working_dir: str, logger):
+    progress_path = get_predictor_progress_path(working_dir)
+    if os.path.exists(progress_path):
+        payload = load_json(progress_path)
+        predictor_targets = {
+            str(group_key): {str(task): float(value) for task, value in group_values.items()}
+            for group_key, group_values in payload.get("predictor_targets", {}).items()
+        }
+        singleton_losses = {
+            str(task): float(value) for task, value in payload.get("singleton_losses", {}).items()
+        }
+        logger.info(
+            "Loaded predictor progress from %s | singleton_groups=%d | total_groups=%d",
+            progress_path,
+            len(singleton_losses),
+            len(predictor_targets),
+        )
+        return predictor_targets, singleton_losses
+
+    log_path = os.path.join(working_dir, "log_rank0.txt")
+    predictor_targets, singleton_losses = parse_predictor_progress_from_log(log_path)
+    if predictor_targets or singleton_losses:
+        logger.info(
+            "Recovered predictor progress from %s | singleton_groups=%d | total_groups=%d",
+            log_path,
+            len(singleton_losses),
+            len(predictor_targets),
+        )
+    return predictor_targets, singleton_losses
+
+
+def save_predictor_progress(
+    working_dir: str,
+    tasks: Sequence[str],
+    train_groups: Sequence[Sequence[str]],
+    singleton_losses: Dict[str, float],
+    predictor_targets: Dict[str, Dict[str, float]],
+    selection_data_split_mode: str,
+    selection_eval_label: str,
+    meta_split_path: str,
+) -> None:
+    progress_payload = {
+        "tasks": list(tasks),
+        "selection_data_split_mode": str(selection_data_split_mode),
+        "selection_eval_label": str(selection_eval_label),
+        "meta_split_path": meta_split_path,
+        "train_groups": [list(group) for group in train_groups],
+        "singleton_losses": round_value_map(singleton_losses),
+        "predictor_targets": {
+            group_key: round_value_map(group_values)
+            for group_key, group_values in predictor_targets.items()
+        },
+    }
+    save_json(progress_payload, get_predictor_progress_path(working_dir))
+
+
+def maybe_load_affinity_result_from_existing_artifacts(config: CN, output_root: str, logger):
+    affinity_json_path = config.MODEL.AGMTLORA.AFFINITY_SAVE_PATH
+    affinity_epoch_history_json = os.path.join(os.path.dirname(affinity_json_path), "affinity_epoch_history.json")
+    warmup_checkpoint_path = os.path.join(output_root, "warmup_checkpoint.pth")
+    post_affinity_checkpoint_path = os.path.join(output_root, "post_affinity_checkpoint.pth")
+    required_paths = [
+        affinity_json_path,
+        affinity_epoch_history_json,
+        warmup_checkpoint_path,
+        post_affinity_checkpoint_path,
+    ]
+    if not all(os.path.exists(path) for path in required_paths):
+        return None
+
+    affinity_payload = load_json(affinity_json_path)
+    epoch_history_payload = load_json(affinity_epoch_history_json)
+    directed_affinity = np.asarray(affinity_payload["directed_affinity"], dtype=np.float32)
+    affinity_epoch_history = [
+        np.asarray(matrix, dtype=np.float32)
+        for matrix in epoch_history_payload.get("epoch_directed_affinity", [])
+    ]
+    warmup_checkpoint = torch.load(warmup_checkpoint_path, map_location="cpu")
+    post_affinity_checkpoint = torch.load(post_affinity_checkpoint_path, map_location="cpu")
+    logger.info(
+        "Resuming Stage-1 from existing affinity artifacts | affinity_json=%s | post_affinity_checkpoint=%s",
+        affinity_json_path,
+        post_affinity_checkpoint_path,
+    )
+    return {
+        "warmup_checkpoint_path": warmup_checkpoint_path,
+        "warmup_state_dict": warmup_checkpoint["model"],
+        "warmup_validation_losses": affinity_payload.get("warmup_validation_losses", {}),
+        "post_affinity_checkpoint_path": post_affinity_checkpoint_path,
+        "post_affinity_state_dict": post_affinity_checkpoint["model"],
+        "post_affinity_validation_losses": affinity_payload.get("post_affinity_validation_losses", {}),
+        "directed_affinity": directed_affinity,
+        "symmetric_affinity": 0.5 * (directed_affinity + directed_affinity.T),
+        "affinity_epoch_history": affinity_epoch_history,
+        "num_batches_per_epoch": list(affinity_payload.get("num_batches_per_epoch", [])),
+        "num_affinity_epochs": int(affinity_payload.get("num_affinity_epochs", len(affinity_epoch_history))),
+        "validation_losses": affinity_payload.get("post_affinity_validation_losses", {}),
+        "selection_data_split_mode": str(affinity_payload.get("selection_data_split_mode", get_selection_data_split_mode(config))),
+        "selection_eval_label": str(affinity_payload.get("selection_eval_label", get_selection_eval_label(config))),
+        "meta_split_path": affinity_payload.get("meta_split_path"),
+        "num_batches": int(sum(affinity_payload.get("num_batches_per_epoch", []))),
+    }
+
+
 def build_stage1_data_split_manifest(config: CN, logger) -> Dict:
     selection_data_split_mode = get_selection_data_split_mode(config)
     meta_split_path = None
@@ -209,9 +360,7 @@ def build_stage1_data_split_manifest(config: CN, logger) -> Dict:
             "meta_split_path": meta_split_path,
         }
 
-    _, eval_transforms = get_transformations(config.DATA.DBNAME, config.TASKS_CONFIG)
-    full_train_dataset = get_mtl_dataset(config.DATA.DBNAME, config, eval_transforms, split="train")
-    sample_ids = get_dataset_sample_ids(full_train_dataset)
+    sample_ids = get_mtl_split_sample_ids(config.DATA.DBNAME, config.DATA.DATA_PATH, split="train")
     num_samples = len(sample_ids)
     if num_samples < 2:
         raise ValueError("AG-MTLoRA Stage-1 strict meta split requires at least 2 training samples.")
@@ -269,16 +418,24 @@ def build_stage1_data_loaders(config: CN, data_split_manifest: Dict = None):
     if meta_train_sample_ids != meta_val_sample_ids:
         raise ValueError("Train-transform and eval-transform views of the train split must preserve sample ordering.")
 
-    meta_train_indices = [int(index) for index in data_split_manifest["meta_train_indices"]]
-    meta_val_indices = [int(index) for index in data_split_manifest["meta_val_indices"]]
     expected_meta_train_ids = [str(sample_id) for sample_id in data_split_manifest.get("meta_train_ids", [])]
     expected_meta_val_ids = [str(sample_id) for sample_id in data_split_manifest.get("meta_val_ids", [])]
+    index_by_sample_id = {sample_id: idx for idx, sample_id in enumerate(meta_train_sample_ids)}
+    meta_train_indices = [index_by_sample_id[sample_id] for sample_id in expected_meta_train_ids if sample_id in index_by_sample_id]
+    meta_val_indices = [index_by_sample_id[sample_id] for sample_id in expected_meta_val_ids if sample_id in index_by_sample_id]
     resolved_meta_train_ids = [meta_train_sample_ids[index] for index in meta_train_indices]
     resolved_meta_val_ids = [meta_train_sample_ids[index] for index in meta_val_indices]
-    if expected_meta_train_ids and expected_meta_train_ids != resolved_meta_train_ids:
+    filtered_expected_meta_train_ids = [sample_id for sample_id in expected_meta_train_ids if sample_id in index_by_sample_id]
+    filtered_expected_meta_val_ids = [sample_id for sample_id in expected_meta_val_ids if sample_id in index_by_sample_id]
+    if filtered_expected_meta_train_ids != resolved_meta_train_ids:
         raise ValueError("Meta-train split manifest does not match the current dataset sample ordering.")
-    if expected_meta_val_ids and expected_meta_val_ids != resolved_meta_val_ids:
+    if filtered_expected_meta_val_ids != resolved_meta_val_ids:
         raise ValueError("Meta-val split manifest does not match the current dataset sample ordering.")
+    if len(meta_train_indices) == 0 or len(meta_val_indices) == 0:
+        raise ValueError(
+            "Stage-1 strict meta split projected to an empty subset for the current task configuration. "
+            "Adjust META_VAL_RATIO or META_SPLIT_SEED."
+        )
 
     dataset_train = Subset(meta_train_dataset_full, meta_train_indices)
     dataset_val = Subset(meta_val_dataset_full, meta_val_indices)
@@ -794,8 +951,10 @@ def collect_predictor_training_targets(
     data_split_manifest: Dict = None,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    singleton_losses = {}
-    predictor_targets = {}
+    predictor_targets, singleton_losses = load_predictor_progress(working_dir, logger)
+    selection_data_split_mode = get_selection_data_split_mode(base_config, data_split_manifest)
+    selection_eval_label = get_selection_eval_label(base_config, data_split_manifest)
+    meta_split_path = None if data_split_manifest is None else data_split_manifest.get("meta_split_path")
 
     singleton_groups = canonicalize_groups(
         [group for group in train_groups if len(group) == 1],
@@ -810,6 +969,14 @@ def collect_predictor_training_targets(
     )
     for singleton_group in singleton_groups:
         task = singleton_group[0]
+        if task in singleton_losses:
+            predictor_targets[group_to_key([task])] = {task: 0.0}
+            logger.info(
+                "Predictor target collection skipped | singleton task=%s already cached | val_loss=%.6f",
+                task,
+                singleton_losses[task],
+            )
+            continue
         logger.info("Predictor target collection | singleton group=%s", singleton_group)
         task_output_dir = os.path.join(working_dir, "predictor_runs", f"singleton__{task}")
         task_config = rebuild_task_config(base_config, [task], output_dir=task_output_dir)
@@ -828,12 +995,30 @@ def collect_predictor_training_targets(
             task,
             singleton_losses[task],
         )
+        save_predictor_progress(
+            working_dir,
+            base_config.TASKS,
+            train_groups,
+            singleton_losses,
+            predictor_targets,
+            selection_data_split_mode,
+            selection_eval_label,
+            meta_split_path,
+        )
 
     for group in train_groups:
         group = list(group)
         if len(group) == 1:
             continue
         group_key = group_to_key(group)
+        cached_group_values = predictor_targets.get(group_key, {})
+        if all(task in cached_group_values for task in group):
+            logger.info(
+                "Predictor target collection skipped | group=%s already cached | gains=%s",
+                group,
+                round_value_map(cached_group_values),
+            )
+            continue
         logger.info("Predictor target collection | group=%s", group)
         group_output_dir = os.path.join(working_dir, "predictor_runs", f"group__{group_key.replace('|', '__')}")
         group_config = rebuild_task_config(base_config, group, output_dir=group_output_dir)
@@ -852,6 +1037,16 @@ def collect_predictor_training_targets(
             "Predictor target collected | group=%s | gains=%s",
             group,
             round_value_map(predictor_targets[group_key]),
+        )
+        save_predictor_progress(
+            working_dir,
+            base_config.TASKS,
+            train_groups,
+            singleton_losses,
+            predictor_targets,
+            selection_data_split_mode,
+            selection_eval_label,
+            meta_split_path,
         )
 
     return predictor_targets, singleton_losses
@@ -1046,12 +1241,14 @@ def run_stage1_pipeline(config: CN, output_root: str, logger):
     selection_eval_label = get_selection_eval_label(config, data_split_manifest)
     meta_split_path = None if data_split_manifest is None else data_split_manifest.get("meta_split_path")
 
-    affinity_result = warmup_and_collect_affinity(
-        config,
-        logger,
-        output_root,
-        data_split_manifest=data_split_manifest,
-    )
+    affinity_result = maybe_load_affinity_result_from_existing_artifacts(config, output_root, logger)
+    if affinity_result is None:
+        affinity_result = warmup_and_collect_affinity(
+            config,
+            logger,
+            output_root,
+            data_split_manifest=data_split_manifest,
+        )
     directed_affinity = affinity_result["directed_affinity"]
     symmetric_affinity = affinity_result["symmetric_affinity"]
     affinity_warmup_epochs = get_affinity_warmup_epochs(config)
@@ -1137,6 +1334,20 @@ def run_stage1_pipeline(config: CN, output_root: str, logger):
                 int(config.MODEL.AGMTLORA.PREDICTOR_TRAIN_GROUP_BUDGET),
                 len(predictor_train_groups),
                 predictor_train_groups)
+    predictor_train_groups_json = os.path.join(output_root, "predictor_train_groups.json")
+    predictor_train_groups_csv = os.path.join(output_root, "predictor_train_groups.csv")
+    save_json(
+        {
+            "tasks": list(config.TASKS),
+            "selection_data_split_mode": selection_data_split_mode,
+            "selection_eval_label": selection_eval_label,
+            "meta_split_path": meta_split_path,
+            "train_groups": predictor_train_groups,
+            "singleton_val_losses": {},
+            "gt_predicted_gains": {},
+        },
+        predictor_train_groups_json,
+    )
     predictor_targets, singleton_losses = collect_predictor_training_targets(
         config,
         logger,
@@ -1145,8 +1356,6 @@ def run_stage1_pipeline(config: CN, output_root: str, logger):
         output_root,
         data_split_manifest=data_split_manifest,
     )
-    predictor_train_groups_json = os.path.join(output_root, "predictor_train_groups.json")
-    predictor_train_groups_csv = os.path.join(output_root, "predictor_train_groups.csv")
     save_json(
         {
             "tasks": list(config.TASKS),
