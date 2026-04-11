@@ -362,6 +362,7 @@ _C.MODEL.AGMTLORA.META_SPLIT_SEED = -1
 _C.MODEL.AGMTLORA.META_SPLIT_SAVE_PATH = ''
 _C.MODEL.AGMTLORA.RESOLVED_META_SPLIT_SEED = 0
 _C.MODEL.AGMTLORA.SEARCH_OBJECTIVE = 'mean_final_predicted_gain'
+_C.MODEL.AGMTLORA.SEARCH_SCORE_SOURCE = 'final_predictions'
 _C.MODEL.AGMTLORA.PREDICTOR_TRAIN_GROUP_BUDGET = 0
 _C.MODEL.AGMTLORA.PREDICTOR_TRAIN_GROUP_STRATEGY = 'all_singletons+all_pairs+random_higher_order'
 _C.MODEL.AGMTLORA.PREDICTOR_GROUP_TRAIN_EPOCHS = 5
@@ -644,6 +645,8 @@ def update_config(config, args):
             config.MODEL.AGMTLORA.AFFINITY_WARMUP_EPOCHS = int(config.MODEL.AGMTLORA.AFFINITY_COLLECT_EPOCHS)
         if int(config.MODEL.AGMTLORA.AFFINITY_SCORE_EPOCHS) < 0:
             raise ValueError("MODEL.AGMTLORA.AFFINITY_SCORE_EPOCHS must be >= 0.")
+        if str(config.MODEL.AGMTLORA.SEARCH_SCORE_SOURCE) not in {"final_predictions", "group_proxy"}:
+            raise ValueError("MODEL.AGMTLORA.SEARCH_SCORE_SOURCE must be one of {'final_predictions', 'group_proxy'}.")
 
         base_output_dir = config.OUTPUT
         config.MODEL.AGMTLORA.AFFINITY_SAVE_PATH = resolve_artifact_path(

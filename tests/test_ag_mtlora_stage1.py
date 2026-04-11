@@ -50,10 +50,12 @@ def build_stage1_config(tmpdir, split_mode="train_meta_strict"):
     config.MODEL.AGMTLORA.AFFINITY_SAVE_PATH = os.path.join(tmpdir, "affinity.json")
     config.MODEL.AGMTLORA.GROUPING_SAVE_PATH = os.path.join(tmpdir, "grouping.json")
     config.MODEL.AGMTLORA.VISUALIZE_SYMMETRIC_AFFINITY = False
+    config.MODEL.AGMTLORA.SEARCH_SCORE_SOURCE = "final_predictions"
     config.MODEL.AGMTLORA.PREDICTOR_TRAIN_GROUP_BUDGET = 3
     config.MODEL.AGMTLORA.PREDICTOR_TRAIN_GROUP_STRATEGY = "all_singletons+all_pairs+random_higher_order"
     config.MODEL.AGMTLORA.BASE_PREDICTOR = "spline_ridge"
     config.MODEL.AGMTLORA.BASE_PREDICTOR_KWARGS = CN(new_allowed=True)
+    config.MODEL.AGMTLORA.RESIDUAL_PREDICTOR = "ridge"
     config.MODEL.AGMTLORA.RESIDUAL_ALPHA = 1.0
     config.MODEL.AGMTLORA.MAX_GROUPS = 2
     config.MODEL.AGMTLORA.TOTAL_SHARED_RANK_BUDGET = 2
@@ -84,6 +86,24 @@ class Stage1MetaSplitTest(unittest.TestCase):
             self.assertEqual(singleton_losses, {"semseg": 1.2345})
             self.assertEqual(predictor_targets["semseg"], {"semseg": 0.0})
             self.assertEqual(predictor_targets["semseg|normals"], {"semseg": 0.1, "normals": 0.2})
+
+    def test_run_partition_search_uses_generic_search_scores_with_existing_tie_breaks(self):
+        tasks = ["task_a", "task_b", "task_c"]
+        search_scores = {}
+        for group in stage1.enumerate_candidate_groups(tasks):
+            search_scores[stage1.group_to_key(group)] = {task: 0.0 for task in group}
+
+        ranked_partitions = stage1.run_partition_search(tasks, search_scores, max_groups=2)
+
+        self.assertEqual(
+            [item["groups"] for item in ranked_partitions],
+            [
+                [["task_a", "task_b", "task_c"]],
+                [["task_a"], ["task_b", "task_c"]],
+                [["task_a", "task_b"], ["task_c"]],
+                [["task_a", "task_c"], ["task_b"]],
+            ],
+        )
 
     def test_build_stage1_data_split_manifest_is_deterministic_and_persists_ids(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -437,10 +457,241 @@ class Stage1MetaSplitTest(unittest.TestCase):
                 predictor_payload = json.load(handle)
             with open(config.MODEL.AGMTLORA.GROUPING_SAVE_PATH, "r", encoding="utf-8") as handle:
                 grouping_payload = json.load(handle)
+            with open(os.path.join(tmpdir, "partition_search_results.json"), "r", encoding="utf-8") as handle:
+                partition_payload = json.load(handle)
 
-            for payload in (affinity_payload, predictor_payload, grouping_payload):
+            for payload in (affinity_payload, predictor_payload, grouping_payload, partition_payload):
                 self.assertEqual(payload["selection_data_split_mode"], "train_meta_strict")
                 self.assertEqual(payload["meta_split_path"], manifest["meta_split_path"])
+            self.assertEqual(grouping_payload["search_score_source"], "final_predictions")
+            self.assertEqual(
+                grouping_payload["search_score_path"],
+                os.path.join(tmpdir, "final_predictions.json"),
+            )
+            self.assertEqual(partition_payload["search_score_source"], "final_predictions")
+            self.assertEqual(
+                partition_payload["search_score_path"],
+                os.path.join(tmpdir, "final_predictions.json"),
+            )
+
+    def test_run_stage1_pipeline_group_proxy_search_skips_predictor_chain_and_writes_suffixed_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = build_stage1_config(tmpdir)
+            config.defrost()
+            config.MODEL.AGMTLORA.SEARCH_SCORE_SOURCE = "group_proxy"
+            config.freeze()
+
+            logger = mock.Mock()
+            manifest = {
+                "selection_data_split_mode": "train_meta_strict",
+                "selection_eval_label": "meta-val",
+                "meta_split_path": os.path.join(tmpdir, "meta_split.json"),
+            }
+            directed_affinity = np.array([[0.0, 1.0], [2.0, 0.0]], dtype=np.float32)
+
+            with mock.patch(
+                "ag_mtlora.stage1.build_stage1_data_split_manifest",
+                return_value=manifest,
+            ), mock.patch(
+                "ag_mtlora.stage1.warmup_and_collect_affinity",
+                return_value={
+                    "directed_affinity": directed_affinity,
+                    "symmetric_affinity": 0.5 * (directed_affinity + directed_affinity.T),
+                    "num_affinity_epochs": 1,
+                    "num_batches_per_epoch": [3],
+                    "affinity_epoch_history": [directed_affinity],
+                    "warmup_checkpoint_path": os.path.join(tmpdir, "warmup_checkpoint.pth"),
+                    "post_affinity_checkpoint_path": os.path.join(tmpdir, "post_affinity_checkpoint.pth"),
+                    "warmup_validation_losses": {"task_a": 1.0, "task_b": 2.0},
+                    "post_affinity_validation_losses": {"task_a": 0.8, "task_b": 1.7},
+                    "post_affinity_state_dict": {},
+                },
+            ), mock.patch(
+                "ag_mtlora.stage1.create_resolved_training_config",
+                return_value=DummyResolvedConfig(),
+            ), mock.patch(
+                "ag_mtlora.stage1.collect_predictor_training_targets"
+            ) as mocked_collect, mock.patch(
+                "ag_mtlora.stage1.fit_base_predictor"
+            ) as mocked_fit_base, mock.patch(
+                "ag_mtlora.stage1.fit_residual_predictor"
+            ) as mocked_fit_residual, mock.patch(
+                "ag_mtlora.stage1.predict_all_candidate_groups"
+            ) as mocked_predict_all, mock.patch(
+                "ag_mtlora.stage1.save_matrix_csv"
+            ), mock.patch(
+                "ag_mtlora.stage1.save_affinity_epoch_history_csv"
+            ), mock.patch(
+                "ag_mtlora.stage1.save_group_task_rows"
+            ):
+                artifacts = stage1.run_stage1_pipeline(
+                    config,
+                    tmpdir,
+                    logger,
+                    base_cfg_path=os.path.join(tmpdir, "base_config.yaml"),
+                )
+
+            mocked_collect.assert_not_called()
+            mocked_fit_base.assert_not_called()
+            mocked_fit_residual.assert_not_called()
+            mocked_predict_all.assert_not_called()
+            self.assertEqual(artifacts["search_score_source"], "group_proxy")
+            self.assertEqual(artifacts["search_score_path"], os.path.join(tmpdir, "group_proxy.json"))
+            self.assertIsNone(artifacts["predictor_train_groups_json"])
+            self.assertIsNone(artifacts["initial_predictions_json"])
+            self.assertIsNone(artifacts["final_predictions_json"])
+            self.assertTrue(artifacts["grouping_json_path"].endswith("grouping__group_proxy.json"))
+            self.assertTrue(artifacts["partition_results_path"].endswith("partition_search_results__group_proxy.json"))
+
+            with open(artifacts["grouping_json_path"], "r", encoding="utf-8") as handle:
+                grouping_payload = json.load(handle)
+            with open(artifacts["partition_results_path"], "r", encoding="utf-8") as handle:
+                partition_payload = json.load(handle)
+
+            self.assertEqual(grouping_payload["search_score_source"], "group_proxy")
+            self.assertEqual(grouping_payload["search_score_path"], os.path.join(tmpdir, "group_proxy.json"))
+            self.assertIsNone(grouping_payload["final_predictions_path"])
+            self.assertEqual(partition_payload["search_score_source"], "group_proxy")
+            self.assertEqual(partition_payload["search_score_path"], os.path.join(tmpdir, "group_proxy.json"))
+            self.assertEqual(partition_payload["ranked_partitions"][0]["groups"], [["task_a", "task_b"]])
+
+    def test_replay_stage1_partition_search_writes_side_by_side_proxy_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tasks = ["task_a", "task_b"]
+            base_cfg_path = os.path.join(tmpdir, "base.yaml")
+            with open(base_cfg_path, "w", encoding="utf-8") as handle:
+                handle.write("MODEL:\n  NAME: replay_test\n")
+
+            group_proxy = {
+                "task_a": {"task_a": 0.0},
+                "task_b": {"task_b": 0.0},
+                "task_a|task_b": {"task_a": 0.9, "task_b": 0.8},
+            }
+            final_predictions = {
+                "task_a": {"task_a": 0.0},
+                "task_b": {"task_b": 0.0},
+                "task_a|task_b": {"task_a": -0.1, "task_b": -0.2},
+            }
+
+            with open(os.path.join(tmpdir, "group_proxy.json"), "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "tasks": tasks,
+                        "selection_data_split_mode": "train_meta_strict",
+                        "selection_eval_label": "meta-val",
+                        "meta_split_path": os.path.join(tmpdir, "meta_split.json"),
+                        "group_proxy": group_proxy,
+                    },
+                    handle,
+                    indent=2,
+                )
+            with open(os.path.join(tmpdir, "final_predictions.json"), "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "tasks": tasks,
+                        "selection_data_split_mode": "train_meta_strict",
+                        "selection_eval_label": "meta-val",
+                        "meta_split_path": os.path.join(tmpdir, "meta_split.json"),
+                        "final_predictions": final_predictions,
+                    },
+                    handle,
+                    indent=2,
+                )
+
+            original_ranked_partitions = stage1.run_partition_search(tasks, final_predictions, max_groups=2)
+            original_grouping_payload = {
+                "tasks": tasks,
+                "groups": [["task_a"], ["task_b"]],
+                "task_to_group": {"task_a": "group_0", "task_b": "group_1"},
+                "max_groups": 2,
+                "partition_score": 0.0,
+                "group_shared_ranks": [[1], [1]],
+                "search_objective": "mean_final_predicted_gain",
+                "search_score_source": "final_predictions",
+                "search_score_path": os.path.join(tmpdir, "final_predictions.json"),
+                "selection_data_split_mode": "train_meta_strict",
+                "selection_eval_label": "meta-val",
+                "meta_split_path": os.path.join(tmpdir, "meta_split.json"),
+                "affinity_path": os.path.join(tmpdir, "affinity.json"),
+                "final_predictions_path": os.path.join(tmpdir, "final_predictions.json"),
+                "warmup_checkpoint": os.path.join(tmpdir, "warmup_checkpoint.pth"),
+                "post_affinity_checkpoint": os.path.join(tmpdir, "post_affinity_checkpoint.pth"),
+                "affinity_warmup_epochs": 5,
+                "affinity_score_epochs": 50,
+                "partition_search_results": os.path.join(tmpdir, "partition_search_results.json"),
+                "group_rank_source": "auto_equal_split",
+            }
+            with open(os.path.join(tmpdir, "grouping.json"), "w", encoding="utf-8") as handle:
+                json.dump(original_grouping_payload, handle, indent=2)
+            with open(os.path.join(tmpdir, "partition_search_results.json"), "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "tasks": tasks,
+                        "selection_data_split_mode": "train_meta_strict",
+                        "selection_eval_label": "meta-val",
+                        "meta_split_path": os.path.join(tmpdir, "meta_split.json"),
+                        "search_objective": "mean_final_predicted_gain",
+                        "search_score_source": "final_predictions",
+                        "search_score_path": os.path.join(tmpdir, "final_predictions.json"),
+                        "ranked_partitions": original_ranked_partitions,
+                    },
+                    handle,
+                    indent=2,
+                )
+            with open(os.path.join(tmpdir, "resolved_agmtlora_runtime_snapshot.yaml"), "w", encoding="utf-8") as handle:
+                yaml.safe_dump(
+                    {
+                        "MODEL": {
+                            "SWIN": {"DEPTHS": [2]},
+                            "AGMTLORA": {
+                                "MAX_GROUPS": 2,
+                                "GROUP_SHARED_RANKS": [],
+                                "TOTAL_SHARED_RANK_BUDGET": 2,
+                                "GROUP_RANK_ALLOCATION": "equal_split",
+                                "SEARCH_OBJECTIVE": "mean_final_predicted_gain",
+                                "SEARCH_SCORE_SOURCE": "final_predictions",
+                            },
+                        }
+                    },
+                    handle,
+                    sort_keys=False,
+                )
+
+            with open(os.path.join(tmpdir, "grouping.json"), "r", encoding="utf-8") as handle:
+                original_grouping_text = handle.read()
+            with open(os.path.join(tmpdir, "partition_search_results.json"), "r", encoding="utf-8") as handle:
+                original_partition_text = handle.read()
+
+            artifacts = stage1.replay_stage1_partition_search(
+                base_cfg_path=base_cfg_path,
+                stage1_dir=tmpdir,
+                search_score_source="group_proxy",
+                logger=mock.Mock(),
+            )
+
+            with open(os.path.join(tmpdir, "grouping.json"), "r", encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), original_grouping_text)
+            with open(os.path.join(tmpdir, "partition_search_results.json"), "r", encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), original_partition_text)
+
+            self.assertTrue(artifacts["grouping_json_path"].endswith("grouping__group_proxy.json"))
+            self.assertTrue(artifacts["partition_results_path"].endswith("partition_search_results__group_proxy.json"))
+            self.assertEqual(artifacts["search_score_source"], "group_proxy")
+            self.assertEqual(artifacts["best_partition"]["groups"], [["task_a", "task_b"]])
+
+            with open(artifacts["grouping_json_path"], "r", encoding="utf-8") as handle:
+                grouping_payload = json.load(handle)
+            with open(artifacts["partition_results_path"], "r", encoding="utf-8") as handle:
+                partition_payload = json.load(handle)
+
+            self.assertEqual(grouping_payload["search_score_source"], "group_proxy")
+            self.assertEqual(grouping_payload["search_score_path"], os.path.join(tmpdir, "group_proxy.json"))
+            self.assertIsNone(grouping_payload["final_predictions_path"])
+            self.assertEqual(partition_payload["ranked_partitions"][0]["groups"], [["task_a", "task_b"]])
+            self.assertEqual(
+                artifacts["ranking_changes"][0],
+                {"partition_key": "task_a|task_b", "old_rank": 2, "new_rank": 1},
+            )
 
 
 if __name__ == "__main__":

@@ -4,11 +4,12 @@ import json
 import os
 import random
 import re
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 import torch
 import torch.nn as nn
+import yaml
 from torch.utils.data import Subset
 from yacs.config import CfgNode as CN
 
@@ -47,10 +48,62 @@ DEFAULT_TASK_LOSS_WEIGHTS = {
 }
 
 PREDICTOR_PROGRESS_FILENAME = "predictor_progress.json"
+DEFAULT_SEARCH_SCORE_SOURCE = "final_predictions"
+SUPPORTED_SEARCH_SCORE_SOURCES = {"final_predictions", "group_proxy"}
 
 
 def group_to_key(group: Sequence[str]) -> str:
     return "|".join(group)
+
+
+def normalize_search_score_source(search_score_source: str) -> str:
+    source = str(search_score_source or DEFAULT_SEARCH_SCORE_SOURCE)
+    if source not in SUPPORTED_SEARCH_SCORE_SOURCES:
+        raise ValueError(
+            f"Unsupported SEARCH_SCORE_SOURCE: {source}. "
+            f"Expected one of {sorted(SUPPORTED_SEARCH_SCORE_SOURCES)}."
+        )
+    return source
+
+
+def get_search_score_source(config: CN) -> str:
+    return normalize_search_score_source(
+        getattr(config.MODEL.AGMTLORA, "SEARCH_SCORE_SOURCE", DEFAULT_SEARCH_SCORE_SOURCE)
+    )
+
+
+def append_search_score_suffix(path: str, search_score_source: str) -> str:
+    source = normalize_search_score_source(search_score_source)
+    if source == DEFAULT_SEARCH_SCORE_SOURCE:
+        return path
+    root, ext = os.path.splitext(path)
+    return f"{root}__{source}{ext}"
+
+
+def build_search_artifact_paths(output_root: str, grouping_save_path: str, search_score_source: str) -> Dict[str, str]:
+    return {
+        "partition_results_path": append_search_score_suffix(
+            os.path.join(output_root, "partition_search_results.json"),
+            search_score_source,
+        ),
+        "partition_results_csv": append_search_score_suffix(
+            os.path.join(output_root, "partition_search_results.csv"),
+            search_score_source,
+        ),
+        "grouping_json_path": append_search_score_suffix(grouping_save_path, search_score_source),
+        "resolved_config_path": append_search_score_suffix(
+            os.path.join(output_root, "resolved_agmtlora_config.yaml"),
+            search_score_source,
+        ),
+        "resolved_runtime_snapshot_path": append_search_score_suffix(
+            os.path.join(output_root, "resolved_agmtlora_runtime_snapshot.yaml"),
+            search_score_source,
+        ),
+    }
+
+
+def partition_to_key(groups: Sequence[Sequence[str]]) -> str:
+    return ";".join(group_to_key(group) for group in groups)
 
 
 def safe_num_batches(data_loader) -> int:
@@ -1191,7 +1244,7 @@ def predict_all_candidate_groups(
     return initial_predictions, residual_predictions, final_predictions
 
 
-def run_partition_search(tasks: Sequence[str], final_predictions: Dict[str, Dict[str, float]], max_groups: int):
+def run_partition_search(tasks: Sequence[str], search_scores: Dict[str, Dict[str, float]], max_groups: int):
     partitions = enumerate_partitions(tasks, max_groups)
     ranked_results = []
     for partition in partitions:
@@ -1200,7 +1253,7 @@ def run_partition_search(tasks: Sequence[str], final_predictions: Dict[str, Dict
         for group in partition:
             group_key = group_to_key(group)
             for task in group:
-                per_task_scores[task] = float(final_predictions[group_key][task])
+                per_task_scores[task] = float(search_scores[group_key][task])
         score = float(np.mean([per_task_scores[task] for task in tasks]))
         ranked_results.append(
             {
@@ -1239,6 +1292,278 @@ def create_resolved_training_config(base_cfg_path: str, grouping_json_path: str,
     ]
     resolved_config.freeze()
     return resolved_config
+
+
+def write_search_artifacts(
+    *,
+    tasks: Sequence[str],
+    search_scores: Dict[str, Dict[str, float]],
+    search_score_source: str,
+    search_score_path: str,
+    output_root: str,
+    grouping_save_path: str,
+    max_groups: int,
+    group_shared_ranks,
+    total_shared_rank_budget: int,
+    num_stages: int,
+    group_rank_allocation: str,
+    search_objective: str,
+    selection_data_split_mode: str,
+    selection_eval_label: str,
+    meta_split_path: Optional[str],
+    affinity_path: Optional[str],
+    final_predictions_path: Optional[str],
+    warmup_checkpoint_path: Optional[str],
+    post_affinity_checkpoint_path: Optional[str],
+    affinity_warmup_epochs: int,
+    affinity_score_epochs: int,
+    base_cfg_path: str,
+    runtime_snapshot_text: str,
+    logger,
+) -> Dict[str, object]:
+    search_score_source = normalize_search_score_source(search_score_source)
+    artifact_paths = build_search_artifact_paths(output_root, grouping_save_path, search_score_source)
+    ranked_partitions = run_partition_search(tasks, search_scores, int(max_groups))
+    logger.info(
+        "Partition search finished | search_score_source=%s | max_groups=%d | num_partitions=%d | best_groups=%s | best_score=%.6f",
+        search_score_source,
+        int(max_groups),
+        len(ranked_partitions),
+        ranked_partitions[0]["groups"],
+        float(ranked_partitions[0]["partition_score"]),
+    )
+
+    save_json(
+        {
+            "tasks": list(tasks),
+            "selection_data_split_mode": selection_data_split_mode,
+            "selection_eval_label": selection_eval_label,
+            "meta_split_path": meta_split_path,
+            "search_objective": str(search_objective),
+            "search_score_source": search_score_source,
+            "search_score_path": search_score_path,
+            "ranked_partitions": ranked_partitions,
+        },
+        artifact_paths["partition_results_path"],
+    )
+    save_partition_csv(ranked_partitions, artifact_paths["partition_results_csv"])
+
+    best_partition = ranked_partitions[0]
+    resolved_group_ranks, rank_source = resolve_group_shared_ranks(
+        group_shared_ranks,
+        int(total_shared_rank_budget),
+        len(best_partition["groups"]),
+        int(num_stages),
+        str(group_rank_allocation),
+    )
+    task_to_group = build_task_to_group(best_partition["groups"])
+    grouping_payload = {
+        "tasks": list(tasks),
+        "groups": best_partition["groups"],
+        "task_to_group": task_to_group,
+        "max_groups": int(max_groups),
+        "partition_score": float(best_partition["partition_score"]),
+        "group_shared_ranks": resolved_group_ranks,
+        "search_objective": str(search_objective),
+        "search_score_source": search_score_source,
+        "search_score_path": search_score_path,
+        "selection_data_split_mode": selection_data_split_mode,
+        "selection_eval_label": selection_eval_label,
+        "meta_split_path": meta_split_path,
+        "affinity_path": affinity_path,
+        "final_predictions_path": final_predictions_path,
+        "warmup_checkpoint": warmup_checkpoint_path,
+        "post_affinity_checkpoint": post_affinity_checkpoint_path,
+        "affinity_warmup_epochs": int(affinity_warmup_epochs),
+        "affinity_score_epochs": int(affinity_score_epochs),
+        "partition_search_results": artifact_paths["partition_results_path"],
+        "group_rank_source": rank_source,
+    }
+    save_json(grouping_payload, artifact_paths["grouping_json_path"])
+    logger.info("Grouping saved to %s", artifact_paths["grouping_json_path"])
+
+    resolved_config = create_resolved_training_config(
+        base_cfg_path,
+        artifact_paths["grouping_json_path"],
+        resolved_group_ranks,
+    )
+    mkdir_if_missing(os.path.dirname(artifact_paths["resolved_config_path"]))
+    with open(artifact_paths["resolved_config_path"], "w", encoding="utf-8") as handle:
+        handle.write(resolved_config.dump())
+    with open(artifact_paths["resolved_runtime_snapshot_path"], "w", encoding="utf-8") as handle:
+        handle.write(runtime_snapshot_text)
+    logger.info("Resolved AG-MTLoRA training config saved to %s", artifact_paths["resolved_config_path"])
+    logger.info(
+        "Resolved AG-MTLoRA runtime snapshot saved to %s",
+        artifact_paths["resolved_runtime_snapshot_path"],
+    )
+
+    return {
+        "ranked_partitions": ranked_partitions,
+        "best_partition": best_partition,
+        "group_rank_source": rank_source,
+        "resolved_group_ranks": resolved_group_ranks,
+        **artifact_paths,
+    }
+
+
+def compare_partition_rankings(
+    original_ranked_partitions: Sequence[Dict],
+    replay_ranked_partitions: Sequence[Dict],
+) -> List[Dict[str, object]]:
+    original_ranks = {
+        partition_to_key(item["groups"]): rank
+        for rank, item in enumerate(original_ranked_partitions, start=1)
+    }
+    replay_ranks = {
+        partition_to_key(item["groups"]): rank
+        for rank, item in enumerate(replay_ranked_partitions, start=1)
+    }
+    ranking_changes = []
+    for partition_key in sorted(set(original_ranks) | set(replay_ranks)):
+        ranking_changes.append(
+            {
+                "partition_key": partition_key,
+                "old_rank": original_ranks.get(partition_key),
+                "new_rank": replay_ranks.get(partition_key),
+            }
+        )
+    ranking_changes.sort(
+        key=lambda item: (
+            item["new_rank"] if item["new_rank"] is not None else 10**9,
+            item["old_rank"] if item["old_rank"] is not None else 10**9,
+            item["partition_key"],
+        )
+    )
+    return ranking_changes
+
+
+def replay_stage1_partition_search(
+    *,
+    base_cfg_path: str,
+    stage1_dir: str,
+    search_score_source: str = "group_proxy",
+    logger=None,
+) -> Dict[str, object]:
+    stage1_dir = os.path.abspath(stage1_dir)
+    search_score_source = normalize_search_score_source(search_score_source)
+    if logger is None:
+        logger = create_stage1_logger(stage1_dir)
+
+    grouping_json_path = os.path.join(stage1_dir, "grouping.json")
+    runtime_snapshot_path = os.path.join(stage1_dir, "resolved_agmtlora_runtime_snapshot.yaml")
+    partition_results_path = os.path.join(stage1_dir, "partition_search_results.json")
+    group_proxy_json_path = os.path.join(stage1_dir, "group_proxy.json")
+    final_predictions_json_path = os.path.join(stage1_dir, "final_predictions.json")
+
+    if not os.path.exists(grouping_json_path):
+        raise FileNotFoundError(f"Missing Stage-1 grouping artifact: {grouping_json_path}")
+    if not os.path.exists(runtime_snapshot_path):
+        raise FileNotFoundError(f"Missing Stage-1 runtime snapshot artifact: {runtime_snapshot_path}")
+
+    score_file_path = (
+        group_proxy_json_path
+        if search_score_source == "group_proxy"
+        else final_predictions_json_path
+    )
+    if not os.path.exists(score_file_path):
+        raise FileNotFoundError(
+            f"Missing Stage-1 score artifact for source '{search_score_source}': {score_file_path}"
+        )
+
+    grouping_payload = load_json(grouping_json_path)
+    score_payload = load_json(score_file_path)
+    original_partition_payload = (
+        load_json(partition_results_path) if os.path.exists(partition_results_path) else {}
+    )
+    with open(runtime_snapshot_path, "r", encoding="utf-8") as handle:
+        runtime_payload = yaml.safe_load(handle) or {}
+
+    tasks = list(score_payload.get("tasks", grouping_payload.get("tasks", [])))
+    if not tasks:
+        raise ValueError("Replay search could not determine the Stage-1 task list.")
+
+    score_key = "group_proxy" if search_score_source == "group_proxy" else "final_predictions"
+    search_scores = score_payload.get(score_key)
+    if not isinstance(search_scores, dict):
+        raise ValueError(
+            f"Replay search expected '{score_key}' in {score_file_path}, but it was not found."
+        )
+
+    model_payload = runtime_payload.get("MODEL", {})
+    agmtlora_payload = model_payload.get("AGMTLORA", {})
+    swin_payload = model_payload.get("SWIN", {})
+    agmtlora_payload["SEARCH_SCORE_SOURCE"] = search_score_source
+    model_payload["AGMTLORA"] = agmtlora_payload
+    runtime_payload["MODEL"] = model_payload
+
+    search_result = write_search_artifacts(
+        tasks=tasks,
+        search_scores=search_scores,
+        search_score_source=search_score_source,
+        search_score_path=score_file_path,
+        output_root=stage1_dir,
+        grouping_save_path=grouping_json_path,
+        max_groups=int(agmtlora_payload.get("MAX_GROUPS", grouping_payload.get("max_groups", len(tasks)))),
+        group_shared_ranks=agmtlora_payload.get("GROUP_SHARED_RANKS", []),
+        total_shared_rank_budget=int(agmtlora_payload.get("TOTAL_SHARED_RANK_BUDGET", 0)),
+        num_stages=len(swin_payload.get("DEPTHS", [])),
+        group_rank_allocation=str(agmtlora_payload.get("GROUP_RANK_ALLOCATION", "equal_split")),
+        search_objective=str(
+            grouping_payload.get(
+                "search_objective",
+                agmtlora_payload.get("SEARCH_OBJECTIVE", "mean_final_predicted_gain"),
+            )
+        ),
+        selection_data_split_mode=str(
+            score_payload.get(
+                "selection_data_split_mode",
+                grouping_payload.get("selection_data_split_mode", "official_val"),
+            )
+        ),
+        selection_eval_label=str(
+            score_payload.get(
+                "selection_eval_label",
+                grouping_payload.get("selection_eval_label", "official val"),
+            )
+        ),
+        meta_split_path=score_payload.get("meta_split_path", grouping_payload.get("meta_split_path")),
+        affinity_path=grouping_payload.get("affinity_path"),
+        final_predictions_path=(
+            final_predictions_json_path if search_score_source == "final_predictions" else None
+        ),
+        warmup_checkpoint_path=grouping_payload.get("warmup_checkpoint"),
+        post_affinity_checkpoint_path=grouping_payload.get("post_affinity_checkpoint"),
+        affinity_warmup_epochs=int(grouping_payload.get("affinity_warmup_epochs", 0)),
+        affinity_score_epochs=int(grouping_payload.get("affinity_score_epochs", 0)),
+        base_cfg_path=base_cfg_path,
+        runtime_snapshot_text=yaml.safe_dump(runtime_payload, sort_keys=False),
+        logger=logger,
+    )
+
+    original_ranked_partitions = original_partition_payload.get("ranked_partitions", [])
+    ranking_changes = compare_partition_rankings(
+        original_ranked_partitions,
+        search_result["ranked_partitions"],
+    )
+    if original_ranked_partitions:
+        logger.info(
+            "Replay search comparison | original_best=%s | original_score=%.6f | replay_best=%s | replay_score=%.6f",
+            original_ranked_partitions[0]["groups"],
+            float(original_ranked_partitions[0]["partition_score"]),
+            search_result["best_partition"]["groups"],
+            float(search_result["best_partition"]["partition_score"]),
+        )
+
+    return {
+        "stage1_dir": stage1_dir,
+        "search_score_source": search_score_source,
+        "search_score_path": score_file_path,
+        "original_partition_results_path": partition_results_path if os.path.exists(partition_results_path) else None,
+        "original_best_partition": original_ranked_partitions[0] if original_ranked_partitions else None,
+        "ranking_changes": ranking_changes,
+        **search_result,
+    }
 
 
 def run_stage1_pipeline(config: CN, output_root: str, logger, base_cfg_path: str):
@@ -1332,232 +1657,209 @@ def run_stage1_pipeline(config: CN, output_root: str, logger, base_cfg_path: str
     )
     save_group_task_rows(group_proxy_rows, group_proxy_csv_path, "proxy")
 
-    predictor_train_groups = select_predictor_train_groups(
-        config.TASKS,
-        int(config.MODEL.AGMTLORA.PREDICTOR_TRAIN_GROUP_BUDGET),
-        config.MODEL.AGMTLORA.PREDICTOR_TRAIN_GROUP_STRATEGY,
-        int(config.SEED),
-    )
-    logger.info("Selected predictor train groups | budget=%d | selected=%d | groups=%s",
-                int(config.MODEL.AGMTLORA.PREDICTOR_TRAIN_GROUP_BUDGET),
-                len(predictor_train_groups),
-                predictor_train_groups)
-    predictor_train_groups_json = os.path.join(output_root, "predictor_train_groups.json")
-    predictor_train_groups_csv = os.path.join(output_root, "predictor_train_groups.csv")
-    save_json(
-        {
-            "tasks": list(config.TASKS),
-            "selection_data_split_mode": selection_data_split_mode,
-            "selection_eval_label": selection_eval_label,
-            "meta_split_path": meta_split_path,
-            "train_groups": predictor_train_groups,
-            "singleton_val_losses": {},
-            "gt_predicted_gains": {},
-        },
-        predictor_train_groups_json,
-    )
-    predictor_targets, singleton_losses = collect_predictor_training_targets(
-        config,
-        logger,
-        affinity_result["post_affinity_state_dict"],
-        predictor_train_groups,
-        output_root,
-        data_split_manifest=data_split_manifest,
-    )
-    save_json(
-        {
-            "tasks": list(config.TASKS),
-            "selection_data_split_mode": selection_data_split_mode,
-            "selection_eval_label": selection_eval_label,
-            "meta_split_path": meta_split_path,
-            "train_groups": predictor_train_groups,
-            "singleton_val_losses": singleton_losses,
-            "gt_predicted_gains": predictor_targets,
-        },
-        predictor_train_groups_json,
-    )
-    save_predictor_value_csv(predictor_targets, predictor_train_groups_csv)
+    search_score_source = get_search_score_source(config)
+    predictor_train_groups_json = None
+    predictor_train_groups_csv = None
+    initial_predictions_json = None
+    residual_predictions_json = None
+    final_predictions_json = None
 
-    base_train_pairs = []
-    for group in predictor_train_groups:
-        group_key = group_to_key(group)
-        for task in group:
-            base_train_pairs.append(
-                {
-                    "group": group_key,
-                    "task": task,
-                    "proxy": float(group_proxy[group_key][task]),
-                    "gain": float(predictor_targets[group_key][task]),
-                }
-            )
+    if search_score_source == "group_proxy":
+        logger.info(
+            "Stage-1 Step C skipped | search_score_source=%s | using group_proxy directly for partition search",
+            search_score_source,
+        )
+        search_scores = group_proxy
+        search_score_path = group_proxy_json_path
+    else:
+        predictor_train_groups = select_predictor_train_groups(
+            config.TASKS,
+            int(config.MODEL.AGMTLORA.PREDICTOR_TRAIN_GROUP_BUDGET),
+            config.MODEL.AGMTLORA.PREDICTOR_TRAIN_GROUP_STRATEGY,
+            int(config.SEED),
+        )
+        logger.info(
+            "Selected predictor train groups | budget=%d | selected=%d | groups=%s",
+            int(config.MODEL.AGMTLORA.PREDICTOR_TRAIN_GROUP_BUDGET),
+            len(predictor_train_groups),
+            predictor_train_groups,
+        )
+        predictor_train_groups_json = os.path.join(output_root, "predictor_train_groups.json")
+        predictor_train_groups_csv = os.path.join(output_root, "predictor_train_groups.csv")
+        save_json(
+            {
+                "tasks": list(config.TASKS),
+                "selection_data_split_mode": selection_data_split_mode,
+                "selection_eval_label": selection_eval_label,
+                "meta_split_path": meta_split_path,
+                "train_groups": predictor_train_groups,
+                "singleton_val_losses": {},
+                "gt_predicted_gains": {},
+            },
+            predictor_train_groups_json,
+        )
+        predictor_targets, singleton_losses = collect_predictor_training_targets(
+            config,
+            logger,
+            affinity_result["post_affinity_state_dict"],
+            predictor_train_groups,
+            output_root,
+            data_split_manifest=data_split_manifest,
+        )
+        save_json(
+            {
+                "tasks": list(config.TASKS),
+                "selection_data_split_mode": selection_data_split_mode,
+                "selection_eval_label": selection_eval_label,
+                "meta_split_path": meta_split_path,
+                "train_groups": predictor_train_groups,
+                "singleton_val_losses": singleton_losses,
+                "gt_predicted_gains": predictor_targets,
+            },
+            predictor_train_groups_json,
+        )
+        save_predictor_value_csv(predictor_targets, predictor_train_groups_csv)
 
-    base_predictor = fit_base_predictor(
-        base_train_pairs,
-        config.MODEL.AGMTLORA.BASE_PREDICTOR,
-        dict(config.MODEL.AGMTLORA.BASE_PREDICTOR_KWARGS),
-    )
-    logger.info(
-        "Base predictor fitted | type=%s | samples=%d | affine_a=%.6f | affine_b=%.6f",
-        base_predictor["predictor_name"],
-        base_predictor["num_samples"],
-        float(base_predictor["affine_a"]),
-        float(base_predictor["affine_b"]),
-    )
+        base_train_pairs = []
+        for group in predictor_train_groups:
+            group_key = group_to_key(group)
+            for task in group:
+                base_train_pairs.append(
+                    {
+                        "group": group_key,
+                        "task": task,
+                        "proxy": float(group_proxy[group_key][task]),
+                        "gain": float(predictor_targets[group_key][task]),
+                    }
+                )
 
-    initial_train_predictions = {}
-    for group in predictor_train_groups:
-        group_key = group_to_key(group)
-        initial_train_predictions[group_key] = {}
-        for task in group:
-            initial_train_predictions[group_key][task] = predict_base_gain(
-                base_predictor,
-                group_proxy[group_key][task],
-            )
+        base_predictor = fit_base_predictor(
+            base_train_pairs,
+            config.MODEL.AGMTLORA.BASE_PREDICTOR,
+            dict(config.MODEL.AGMTLORA.BASE_PREDICTOR_KWARGS),
+        )
+        logger.info(
+            "Base predictor fitted | type=%s | samples=%d | affine_a=%.6f | affine_b=%.6f",
+            base_predictor["predictor_name"],
+            base_predictor["num_samples"],
+            float(base_predictor["affine_a"]),
+            float(base_predictor["affine_b"]),
+        )
 
-    residual_model = fit_residual_predictor(
-        config.TASKS,
-        predictor_train_groups,
-        predictor_targets,
-        initial_train_predictions,
-        float(config.MODEL.AGMTLORA.RESIDUAL_ALPHA),
-    )
-    logger.info(
-        "Residual predictor fitted | type=%s | alpha=%.6f",
-        str(config.MODEL.AGMTLORA.RESIDUAL_PREDICTOR),
-        float(config.MODEL.AGMTLORA.RESIDUAL_ALPHA),
-    )
+        initial_train_predictions = {}
+        for group in predictor_train_groups:
+            group_key = group_to_key(group)
+            initial_train_predictions[group_key] = {}
+            for task in group:
+                initial_train_predictions[group_key][task] = predict_base_gain(
+                    base_predictor,
+                    group_proxy[group_key][task],
+                )
 
-    initial_predictions, residual_predictions, final_predictions = predict_all_candidate_groups(
-        config.TASKS,
-        candidate_groups,
-        group_proxy,
-        base_predictor,
-        residual_model,
-    )
+        residual_model = fit_residual_predictor(
+            config.TASKS,
+            predictor_train_groups,
+            predictor_targets,
+            initial_train_predictions,
+            float(config.MODEL.AGMTLORA.RESIDUAL_ALPHA),
+        )
+        logger.info(
+            "Residual predictor fitted | type=%s | alpha=%.6f",
+            str(config.MODEL.AGMTLORA.RESIDUAL_PREDICTOR),
+            float(config.MODEL.AGMTLORA.RESIDUAL_ALPHA),
+        )
 
-    initial_predictions_json = os.path.join(output_root, "initial_predictions.json")
-    residual_predictions_json = os.path.join(output_root, "residual_predictions.json")
-    final_predictions_json = os.path.join(output_root, "final_predictions.json")
-    save_json(
-        {
-            "tasks": list(config.TASKS),
-            "selection_data_split_mode": selection_data_split_mode,
-            "selection_eval_label": selection_eval_label,
-            "meta_split_path": meta_split_path,
-            "initial_predictions": initial_predictions,
-        },
-        initial_predictions_json,
-    )
-    save_json(
-        {
-            "tasks": list(config.TASKS),
-            "selection_data_split_mode": selection_data_split_mode,
-            "selection_eval_label": selection_eval_label,
-            "meta_split_path": meta_split_path,
-            "residual_predictions": residual_predictions,
-        },
-        residual_predictions_json,
-    )
-    save_json(
-        {
-            "tasks": list(config.TASKS),
-            "selection_data_split_mode": selection_data_split_mode,
-            "selection_eval_label": selection_eval_label,
-            "meta_split_path": meta_split_path,
-            "final_predictions": final_predictions,
-        },
-        final_predictions_json,
-    )
-    save_predictor_value_csv(initial_predictions, os.path.join(output_root, "initial_predictions.csv"))
-    save_predictor_value_csv(residual_predictions, os.path.join(output_root, "residual_predictions.csv"))
-    save_predictor_value_csv(final_predictions, os.path.join(output_root, "final_predictions.csv"))
+        initial_predictions, residual_predictions, final_predictions = predict_all_candidate_groups(
+            config.TASKS,
+            candidate_groups,
+            group_proxy,
+            base_predictor,
+            residual_model,
+        )
 
-    ranked_partitions = run_partition_search(
-        config.TASKS,
-        final_predictions,
-        int(config.MODEL.AGMTLORA.MAX_GROUPS),
-    )
-    logger.info(
-        "Partition search finished | max_groups=%d | num_partitions=%d | best_groups=%s | best_score=%.6f",
-        int(config.MODEL.AGMTLORA.MAX_GROUPS),
-        len(ranked_partitions),
-        ranked_partitions[0]["groups"],
-        float(ranked_partitions[0]["partition_score"]),
-    )
-    partition_results_path = os.path.join(output_root, "partition_search_results.json")
-    partition_results_csv = os.path.join(output_root, "partition_search_results.csv")
-    save_json(
-        {
-            "tasks": list(config.TASKS),
-            "selection_data_split_mode": selection_data_split_mode,
-            "selection_eval_label": selection_eval_label,
-            "meta_split_path": meta_split_path,
-            "search_objective": str(config.MODEL.AGMTLORA.SEARCH_OBJECTIVE),
-            "ranked_partitions": ranked_partitions,
-        },
-        partition_results_path,
-    )
-    save_partition_csv(ranked_partitions, partition_results_csv)
+        initial_predictions_json = os.path.join(output_root, "initial_predictions.json")
+        residual_predictions_json = os.path.join(output_root, "residual_predictions.json")
+        final_predictions_json = os.path.join(output_root, "final_predictions.json")
+        save_json(
+            {
+                "tasks": list(config.TASKS),
+                "selection_data_split_mode": selection_data_split_mode,
+                "selection_eval_label": selection_eval_label,
+                "meta_split_path": meta_split_path,
+                "initial_predictions": initial_predictions,
+            },
+            initial_predictions_json,
+        )
+        save_json(
+            {
+                "tasks": list(config.TASKS),
+                "selection_data_split_mode": selection_data_split_mode,
+                "selection_eval_label": selection_eval_label,
+                "meta_split_path": meta_split_path,
+                "residual_predictions": residual_predictions,
+            },
+            residual_predictions_json,
+        )
+        save_json(
+            {
+                "tasks": list(config.TASKS),
+                "selection_data_split_mode": selection_data_split_mode,
+                "selection_eval_label": selection_eval_label,
+                "meta_split_path": meta_split_path,
+                "final_predictions": final_predictions,
+            },
+            final_predictions_json,
+        )
+        save_predictor_value_csv(initial_predictions, os.path.join(output_root, "initial_predictions.csv"))
+        save_predictor_value_csv(residual_predictions, os.path.join(output_root, "residual_predictions.csv"))
+        save_predictor_value_csv(final_predictions, os.path.join(output_root, "final_predictions.csv"))
+        search_scores = final_predictions
+        search_score_path = final_predictions_json
 
-    best_partition = ranked_partitions[0]
-    resolved_group_ranks, rank_source = resolve_group_shared_ranks(
-        config.MODEL.AGMTLORA.GROUP_SHARED_RANKS,
-        int(config.MODEL.AGMTLORA.TOTAL_SHARED_RANK_BUDGET),
-        len(best_partition["groups"]),
-        len(config.MODEL.SWIN.DEPTHS),
-        str(config.MODEL.AGMTLORA.GROUP_RANK_ALLOCATION),
+    search_artifacts = write_search_artifacts(
+        tasks=config.TASKS,
+        search_scores=search_scores,
+        search_score_source=search_score_source,
+        search_score_path=search_score_path,
+        output_root=output_root,
+        grouping_save_path=config.MODEL.AGMTLORA.GROUPING_SAVE_PATH,
+        max_groups=int(config.MODEL.AGMTLORA.MAX_GROUPS),
+        group_shared_ranks=config.MODEL.AGMTLORA.GROUP_SHARED_RANKS,
+        total_shared_rank_budget=int(config.MODEL.AGMTLORA.TOTAL_SHARED_RANK_BUDGET),
+        num_stages=len(config.MODEL.SWIN.DEPTHS),
+        group_rank_allocation=str(config.MODEL.AGMTLORA.GROUP_RANK_ALLOCATION),
+        search_objective=str(config.MODEL.AGMTLORA.SEARCH_OBJECTIVE),
+        selection_data_split_mode=selection_data_split_mode,
+        selection_eval_label=selection_eval_label,
+        meta_split_path=meta_split_path,
+        affinity_path=affinity_json_path,
+        final_predictions_path=final_predictions_json,
+        warmup_checkpoint_path=affinity_result["warmup_checkpoint_path"],
+        post_affinity_checkpoint_path=affinity_result["post_affinity_checkpoint_path"],
+        affinity_warmup_epochs=affinity_warmup_epochs,
+        affinity_score_epochs=affinity_score_epochs,
+        base_cfg_path=base_cfg_path,
+        runtime_snapshot_text=config.dump(),
+        logger=logger,
     )
-    task_to_group = build_task_to_group(best_partition["groups"])
-    grouping_payload = {
-        "tasks": list(config.TASKS),
-        "groups": best_partition["groups"],
-        "task_to_group": task_to_group,
-        "max_groups": int(config.MODEL.AGMTLORA.MAX_GROUPS),
-        "partition_score": float(best_partition["partition_score"]),
-        "group_shared_ranks": resolved_group_ranks,
-        "search_objective": str(config.MODEL.AGMTLORA.SEARCH_OBJECTIVE),
-        "selection_data_split_mode": selection_data_split_mode,
-        "selection_eval_label": selection_eval_label,
-        "meta_split_path": meta_split_path,
-        "affinity_path": affinity_json_path,
-        "final_predictions_path": final_predictions_json,
-        "warmup_checkpoint": affinity_result["warmup_checkpoint_path"],
-        "post_affinity_checkpoint": affinity_result["post_affinity_checkpoint_path"],
-        "affinity_warmup_epochs": affinity_warmup_epochs,
-        "affinity_score_epochs": affinity_score_epochs,
-        "partition_search_results": partition_results_path,
-        "group_rank_source": rank_source,
-    }
-    grouping_json_path = config.MODEL.AGMTLORA.GROUPING_SAVE_PATH
-    save_json(grouping_payload, grouping_json_path)
-    logger.info("Grouping saved to %s", grouping_json_path)
-
-    resolved_config = create_resolved_training_config(base_cfg_path, grouping_json_path, resolved_group_ranks)
-    resolved_config_path = os.path.join(output_root, "resolved_agmtlora_config.yaml")
-    resolved_runtime_snapshot_path = os.path.join(output_root, "resolved_agmtlora_runtime_snapshot.yaml")
-    mkdir_if_missing(os.path.dirname(resolved_config_path))
-    with open(resolved_config_path, "w", encoding="utf-8") as handle:
-        handle.write(resolved_config.dump())
-    with open(resolved_runtime_snapshot_path, "w", encoding="utf-8") as handle:
-        handle.write(config.dump())
-    logger.info("Resolved AG-MTLoRA training config saved to %s", resolved_config_path)
-    logger.info("Resolved AG-MTLoRA runtime snapshot saved to %s", resolved_runtime_snapshot_path)
 
     return {
         "affinity_json_path": affinity_json_path,
         "affinity_epoch_history_json": affinity_epoch_history_json,
         "affinity_epoch_history_csv": affinity_epoch_history_csv,
         "group_proxy_json_path": group_proxy_json_path,
+        "search_score_source": search_score_source,
+        "search_score_path": search_score_path,
         "predictor_train_groups_json": predictor_train_groups_json,
         "predictor_train_groups_csv": predictor_train_groups_csv,
         "initial_predictions_json": initial_predictions_json,
         "residual_predictions_json": residual_predictions_json,
         "final_predictions_json": final_predictions_json,
-        "partition_results_path": partition_results_path,
-        "partition_results_csv": partition_results_csv,
-        "grouping_json_path": grouping_json_path,
-        "resolved_config_path": resolved_config_path,
-        "resolved_runtime_snapshot_path": resolved_runtime_snapshot_path,
+        "partition_results_path": search_artifacts["partition_results_path"],
+        "partition_results_csv": search_artifacts["partition_results_csv"],
+        "grouping_json_path": search_artifacts["grouping_json_path"],
+        "resolved_config_path": search_artifacts["resolved_config_path"],
+        "resolved_runtime_snapshot_path": search_artifacts["resolved_runtime_snapshot_path"],
         "warmup_checkpoint_path": affinity_result["warmup_checkpoint_path"],
         "post_affinity_checkpoint_path": affinity_result["post_affinity_checkpoint_path"],
         "meta_split_path": meta_split_path,
