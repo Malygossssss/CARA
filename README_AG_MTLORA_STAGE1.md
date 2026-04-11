@@ -39,6 +39,8 @@ AG-MTLoRA Stage-1 是在当前 MTLoRA / UniPoRA 代码基础上实现的一个 g
   - Stage-1 prepare 主流程：warmup、多 epoch directed affinity、group proxy、predictor chain、partition search、artifact 导出。
 - `scripts/ag_mtlora_stage1_prepare.py`
   - 两步工作流中的 Step-1 入口脚本。
+- `scripts/ag_mtlora_stage1_replay_search.py`
+  - 只读取已有 Stage-1 输出目录、重放 partition search 的离线脚本。
 - `configs/mtlora/tiny_448/pascal/ag_mtlora_stage1_tiny_448_r64_scale4_pertask.yaml`
   - PASCAL 四任务默认 Stage-1 配置。
 - `configs/mtlora/tiny_448/nyud/ag_mtlora_stage1_tiny_448_r64_scale4_pertask_nyud.yaml`
@@ -48,6 +50,7 @@ AG-MTLoRA Stage-1 是在当前 MTLoRA / UniPoRA 代码基础上实现的一个 g
 
 - `config.py`
   - 新增 `AFFINITY_WARMUP_EPOCHS` 和 `AFFINITY_SCORE_EPOCHS`。
+  - 新增 `SEARCH_SCORE_SOURCE`，支持用 `final_predictions` 或 `group_proxy` 做 partition search。
   - 保留 `AFFINITY_COLLECT_EPOCHS` 作为兼容别名；如果没有显式设置 `AFFINITY_WARMUP_EPOCHS`，则回退到该旧字段。
 - `models/lora.py`
   - 将单一 shared TA-LoRA 扩展为多个 group-specific TA-LoRA banks。
@@ -112,7 +115,9 @@ AG-MTLoRA Stage-1 是在当前 MTLoRA / UniPoRA 代码基础上实现的一个 g
 
 ### Step C. predictor chain
 
-搜索之前先训练一个 ETAP 风格的 predictor chain。
+默认情况下，搜索之前先训练一个 ETAP 风格的 predictor chain。
+
+如果 `MODEL.AGMTLORA.SEARCH_SCORE_SOURCE=group_proxy`，则 Step C 会被整体跳过，直接把 Step B 的 `group-by-task proxy` 作为 Step D 的输入。
 
 1. sampled training groups
 
@@ -139,15 +144,24 @@ AG-MTLoRA Stage-1 是在当前 MTLoRA / UniPoRA 代码基础上实现的一个 g
 - `residual_predictions = residual(mask)`
 - `final_predictions = initial_predictions + residual_predictions`
 
-后续 partition search 只读取 `final_predictions`，不会直接使用 raw affinity 或 raw proxy。
+默认情况下，后续 partition search 读取 `final_predictions`。
+
+可选地，将 `MODEL.AGMTLORA.SEARCH_SCORE_SOURCE` 设为 `group_proxy` 后，partition search 会直接读取 `group_proxy`，不再使用 `initial_predictions`、`residual_predictions` 和 `final_predictions`。
 
 ### Step D. partition-constrained search
 
-对所有 candidate groups 先生成 group-by-task final predicted gains，然后再做 partition-constrained exhaustive search。
+对所有 candidate groups 先准备好 group-by-task search score，然后再做 partition-constrained exhaustive search。
+
+可用 search score source：
+
+- `final_predictions`
+  - 默认选项，使用 Step C 输出的 `initial_predictions + residual_predictions`
+- `group_proxy`
+  - 直接使用 Step B 输出的 `group-by-task proxy`
 
 partition `P` 的得分为：
 
-`score(P) = mean_{t in T} final_pred[group_of_P(t)][t]`
+`score(P) = mean_{t in T} search_score[group_of_P(t)][t]`
 
 tie-break 顺序固定为：
 
@@ -214,6 +228,7 @@ baseline checkpoint 初始化规则：
 - `AFFINITY_SAVE_PATH`
 - `GROUPING_SAVE_PATH`
 - `SEARCH_OBJECTIVE`
+- `SEARCH_SCORE_SOURCE`
 - `PREDICTOR_TRAIN_GROUP_BUDGET`
 - `PREDICTOR_TRAIN_GROUP_STRATEGY`
 - `PREDICTOR_GROUP_TRAIN_EPOCHS`
@@ -227,6 +242,13 @@ baseline checkpoint 初始化规则：
 
 - 推荐新配置使用 `AFFINITY_WARMUP_EPOCHS` 和 `AFFINITY_SCORE_EPOCHS`
 - 旧配置如果只写了 `AFFINITY_COLLECT_EPOCHS`，则它会被解释为 warmup epoch 数
+
+`SEARCH_SCORE_SOURCE` 说明：
+
+- `final_predictions`
+  - 默认值，保持原始 predictor-chain + partition search 逻辑
+- `group_proxy`
+  - 跳过 Step C，直接用 `group_proxy` 做 Step D
 
 ## 7. 运行流程
 
@@ -261,6 +283,38 @@ python scripts/ag_mtlora_stage1_prepare.py \
   --tasks semseg,normals,depth,edge \
   --batch-size 8 \
   --resume-backbone backbone/swin_tiny_patch4_window7_224.pth
+```
+
+如果希望在主流程里直接改用 `group_proxy` 做 search，可以通过 `--opts` 覆盖：
+
+```bash
+python scripts/ag_mtlora_stage1_prepare.py \
+  --cfg configs/mtlora/tiny_448/pascal/ag_mtlora_stage1_tiny_448_r64_scale4_pertask.yaml \
+  --pascal /path/to/PASCAL_MT \
+  --tasks semseg,normals,sal,human_parts \
+  --batch-size 8 \
+  --resume-backbone backbone/swin_tiny_patch4_window7_224.pth \
+  --opts MODEL.AGMTLORA.SEARCH_SCORE_SOURCE group_proxy
+```
+
+如果你已经有一个完整的 Stage-1 输出目录，并且只想复用已有 affinity / group proxy 重做 search，不重新跑 warmup、affinity 和 predictor chain，可以直接使用离线 replay 脚本：
+
+```bash
+python scripts/ag_mtlora_stage1_replay_search.py \
+  --cfg configs/mtlora/tiny_448/pascal/ag_mtlora_stage1_tiny_448_r64_scale4_pertask.yaml \
+  --stage1-dir output/ag_mtlora_stage1_tiny_448_r64_scale4_pertask/default/ag_mtlora_stage1_prepare/run_20260406_065115 \
+  --score-source group_proxy
+```
+
+如果你更倾向继续走 `scripts/ag_mtlora_stage1_prepare.py`，也可以利用 `--resume-stage1-dir` 复用已有 run 目录中的 affinity artifacts：
+
+```bash
+python scripts/ag_mtlora_stage1_prepare.py \
+  --cfg configs/mtlora/tiny_448/pascal/ag_mtlora_stage1_tiny_448_r64_scale4_pertask.yaml \
+  --pascal /path/to/PASCAL_MT \
+  --tasks semseg,normals,sal,human_parts \
+  --resume-stage1-dir output/ag_mtlora_stage1_tiny_448_r64_scale4_pertask/default/ag_mtlora_stage1_prepare/run_20260406_065115 \
+  --opts MODEL.AGMTLORA.SEARCH_SCORE_SOURCE group_proxy
 ```
 
 Step-1 输出目录形如：
@@ -353,6 +407,21 @@ Step-1 至少会生成以下 artifacts：
   - warmup 结束后的中间 checkpoint
 - `post_affinity_checkpoint.pth`
   - Step-2 默认推荐初始化 checkpoint
+
+当 `SEARCH_SCORE_SOURCE=group_proxy` 时：
+
+- Step C 被跳过，因此默认不会生成 `predictor_train_groups.json`、`initial_predictions.json`、`residual_predictions.json`、`final_predictions.json` 这类 predictor-chain artifacts。
+- search 相关产物会并排写成带后缀的文件，避免覆盖默认 `final_predictions` 版本：
+  - `partition_search_results__group_proxy.json`
+  - `partition_search_results__group_proxy.csv`
+  - `grouping__group_proxy.json`
+  - `resolved_agmtlora_config__group_proxy.yaml`
+  - `resolved_agmtlora_runtime_snapshot__group_proxy.yaml`
+- `partition_search_results*.json` 和 `grouping*.json` 中会额外记录：
+  - `search_score_source`
+  - `search_score_path`
+
+离线 replay 脚本也遵循同样的 side-by-side 命名规则；默认的 `partition_search_results.json` 和 `grouping.json` 不会被覆盖。
 
 正式训练日志和 checkpoint 继续使用原始训练目录格式：
 

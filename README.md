@@ -107,6 +107,8 @@ Standard Swin baselines are kept under `configs/swin/`.
 
 ## Utilities
 
+AG-MTLoRA Stage-1 specific workflow, search configuration, and replay-search usage are documented in `README_AG_MTLORA_STAGE1.md`.
+
 Compute Delta-m from logs:
 
 ```bash
