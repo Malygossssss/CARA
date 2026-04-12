@@ -146,6 +146,8 @@ output/
 *.zip
 wandb/*
 
+.claude
+
 /NYUv2
 /NYUv2_MT
 /output
