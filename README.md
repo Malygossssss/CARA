@@ -90,6 +90,12 @@ python -m torch.distributed.launch --nproc_per_node 1 main.py \
   --resume-backbone backbone/swin_tiny_patch4_window7_224.pth
 ```
 
+# Single GPU (backward compatible)
+torchrun --nproc_per_node=1 main.py --cfg configs/... --tasks semseg,normals,sal,human_parts ...
+
+# Multi GPU
+torchrun --nproc_per_node=4 main.py --cfg configs/... --tasks semseg,normals,sal,human_parts ...
+
 ## Available Configs
 
 Kept MTLoRA configs:
