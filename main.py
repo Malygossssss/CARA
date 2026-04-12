@@ -20,6 +20,7 @@ import random
 import argparse
 import datetime
 import shutil
+from contextlib import nullcontext
 import numpy as np
 
 import torch
@@ -174,8 +175,6 @@ def main(config):
 
     logger.info(f"ptflops GMACS = {macs} and params = {params}")
 
-    model_without_ddp = model
-
     optimizer = build_optimizer(config, model)
 
     loss_scaler = NativeScalerWithGradNormCount()
@@ -230,7 +229,7 @@ def main(config):
                 f'no checkpoint found in {config.OUTPUT}, ignoring auto resume')
     if config.MODEL.RESUME:
         max_accuracy = load_checkpoint(
-            config, model_without_ddp, optimizer, lr_scheduler, loss_scaler, logger)
+            config, model, optimizer, lr_scheduler, loss_scaler, logger)
 
         if not config.SKIP_INITIAL_EVAL:
             validate(config, data_loader_val, model, 0)
@@ -239,7 +238,7 @@ def main(config):
 
     if config.MODEL.RESUME_BACKBONE:
         max_accuracy = load_checkpoint(
-            config, model_without_ddp.backbone, optimizer, lr_scheduler, loss_scaler, logger, True)
+            config, model.backbone, optimizer, lr_scheduler, loss_scaler, logger, True)
         if config.EVAL_MODE:
             validate(config, data_loader_val, model, 0)
             return
@@ -249,7 +248,7 @@ def main(config):
         return
 
     if config.MODEL.PRETRAINED and (not config.MODEL.RESUME):
-        load_pretrained(config, model_without_ddp, logger)
+        load_pretrained(config, model, logger)
         if not config.SKIP_INITIAL_EVAL:
             acc1, _, _ = validate(config, data_loader_val, model, 0)
 
@@ -288,12 +287,23 @@ def main(config):
         f"Total params:               {total_model_params:,} (trainable ratio: {trainable_params/total_model_params * 100:2.2f}%)\n"
         f"Total params without LoRA:  {total_model_params_without_lora:,} (trainable ratio: {trainable_params/total_model_params_without_lora * 100:2.2f}%)"
     )
+    # --- DDP wrapping (after all model setup) ---
+    model_without_ddp = model
+    if dist.get_world_size() > 1:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[config.LOCAL_RANK],
+            broadcast_buffers=False,
+            find_unused_parameters=True,
+        )
+        model_without_ddp = model.module
+
     logger.info("Start training")
     start_time = time.perf_counter()
 
     epoch = config.TRAIN.START_EPOCH
     for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
-        if not config.MTL:
+        if hasattr(data_loader_train.sampler, 'set_epoch'):
             data_loader_train.sampler.set_epoch(epoch)
 
         train_one_epoch(config, model, criterion, data_loader_train,
@@ -371,71 +381,77 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
 
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
-        with torch.cuda.amp.autocast(enabled=config.AMP_ENABLE):
-            outputs = model(samples)
-            loss, loss_dict = criterion(outputs, targets)
 
-        if config.DEBUG_REPRO_STEPS > 0 and idx < config.DEBUG_REPRO_STEPS and dist.get_rank() == 0:
-            sample_mean = float(samples.mean().item())
-            sample_std = float(samples.std().item())
+        # Skip gradient sync on intermediate accumulation steps for DDP efficiency
+        is_accumulating = (idx + 1) % config.TRAIN.ACCUMULATION_STEPS != 0
+        sync_ctx = model.no_sync if (hasattr(model, 'no_sync') and is_accumulating) else nullcontext
 
-            batch_ids = []
-            if isinstance(batch, dict) and 'meta' in batch and isinstance(batch['meta'], dict) and 'image' in batch['meta']:
-                ids = batch['meta']['image']
-                if isinstance(ids, (list, tuple)):
-                    batch_ids = [str(x) for x in ids[:4]]
+        with sync_ctx():
+            with torch.cuda.amp.autocast(enabled=config.AMP_ENABLE):
+                outputs = model(samples)
+                loss, loss_dict = criterion(outputs, targets)
+
+            if config.DEBUG_REPRO_STEPS > 0 and idx < config.DEBUG_REPRO_STEPS and dist.get_rank() == 0:
+                sample_mean = float(samples.mean().item())
+                sample_std = float(samples.std().item())
+
+                batch_ids = []
+                if isinstance(batch, dict) and 'meta' in batch and isinstance(batch['meta'], dict) and 'image' in batch['meta']:
+                    ids = batch['meta']['image']
+                    if isinstance(ids, (list, tuple)):
+                        batch_ids = [str(x) for x in ids[:4]]
+                    else:
+                        batch_ids = [str(ids)]
+
+                target_stats = []
+                if isinstance(targets, dict):
+                    for task_name, task_tensor in targets.items():
+                        task_tensor_f = task_tensor.float()
+                        stat = f"{task_name}:mean={float(task_tensor_f.mean().item()):.6f},std={float(task_tensor_f.std().item()):.6f}"
+                        if task_tensor.dim() >= 3:
+                            labels = task_tensor.long().view(-1)
+                            valid = labels != 255
+                            valid_ratio = float(valid.float().mean().item())
+                            stat += f",valid_ratio={valid_ratio:.6f}"
+                            if task_name in {'semseg', 'human_parts'} and valid.any():
+                                valid_labels = labels[valid]
+                                uniq, counts = torch.unique(valid_labels, return_counts=True)
+                                topk = min(3, uniq.numel())
+                                if topk > 0:
+                                    order = torch.argsort(counts, descending=True)[:topk]
+                                    top_items = [f"{int(uniq[i])}:{int(counts[i])}" for i in order]
+                                    stat += f",top_labels={','.join(top_items)}"
+                        target_stats.append(stat)
                 else:
-                    batch_ids = [str(ids)]
+                    target_tensor = targets.float()
+                    target_stats.append(f"cls:mean={float(target_tensor.mean().item()):.6f},std={float(target_tensor.std().item()):.6f}")
 
-            target_stats = []
-            if isinstance(targets, dict):
-                for task_name, task_tensor in targets.items():
-                    task_tensor_f = task_tensor.float()
-                    stat = f"{task_name}:mean={float(task_tensor_f.mean().item()):.6f},std={float(task_tensor_f.std().item()):.6f}"
-                    if task_tensor.dim() >= 3:
-                        labels = task_tensor.long().view(-1)
-                        valid = labels != 255
-                        valid_ratio = float(valid.float().mean().item())
-                        stat += f",valid_ratio={valid_ratio:.6f}"
-                        if task_name in {'semseg', 'human_parts'} and valid.any():
-                            valid_labels = labels[valid]
-                            uniq, counts = torch.unique(valid_labels, return_counts=True)
-                            topk = min(3, uniq.numel())
-                            if topk > 0:
-                                order = torch.argsort(counts, descending=True)[:topk]
-                                top_items = [f"{int(uniq[i])}:{int(counts[i])}" for i in order]
-                                stat += f",top_labels={','.join(top_items)}"
-                    target_stats.append(stat)
-            else:
-                target_tensor = targets.float()
-                target_stats.append(f"cls:mean={float(target_tensor.mean().item()):.6f},std={float(target_tensor.std().item()):.6f}")
+                output_stats = []
+                if isinstance(outputs, dict):
+                    for task_name, out in outputs.items():
+                        out = out.float()
+                        output_stats.append(f"{task_name}:mean={float(out.mean().item()):.6f},std={float(out.std().item()):.6f}")
+                else:
+                    out = outputs.float()
+                    output_stats.append(f"cls:mean={float(out.mean().item()):.6f},std={float(out.std().item()):.6f}")
 
-            output_stats = []
-            if isinstance(outputs, dict):
-                for task_name, out in outputs.items():
-                    out = out.float()
-                    output_stats.append(f"{task_name}:mean={float(out.mean().item()):.6f},std={float(out.std().item()):.6f}")
-            else:
-                out = outputs.float()
-                output_stats.append(f"cls:mean={float(out.mean().item()):.6f},std={float(out.std().item()):.6f}")
+                logger.info(
+                    "[debug_repro] epoch=%d step=%d ids=%s sample(mean=%.6f,std=%.6f) target_stats=[%s] output_stats=[%s] loss=%.6f",
+                    epoch,
+                    idx,
+                    batch_ids,
+                    sample_mean,
+                    sample_std,
+                    "; ".join(target_stats),
+                    "; ".join(output_stats),
+                    float(loss.item()),
+                )
 
-            logger.info(
-                "[debug_repro] epoch=%d step=%d ids=%s sample(mean=%.6f,std=%.6f) target_stats=[%s] output_stats=[%s] loss=%.6f",
-                epoch,
-                idx,
-                batch_ids,
-                sample_mean,
-                sample_std,
-                "; ".join(target_stats),
-                "; ".join(output_stats),
-                float(loss.item()),
-            )
-
-        is_second_order = hasattr(
-            optimizer, 'is_second_order') and optimizer.is_second_order
-        grad_norm = loss_scaler(loss, optimizer, clip_grad=config.TRAIN.CLIP_GRAD,
-                                parameters=model.parameters(), create_graph=is_second_order,
-                                update_grad=(idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0)
+            is_second_order = hasattr(
+                optimizer, 'is_second_order') and optimizer.is_second_order
+            grad_norm = loss_scaler(loss, optimizer, clip_grad=config.TRAIN.CLIP_GRAD,
+                                    parameters=model.parameters(), create_graph=is_second_order,
+                                    update_grad=(idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0)
         if (idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0:
             optimizer.zero_grad()
             lr_scheduler.step_update(
@@ -759,17 +775,20 @@ if __name__ == '__main__':
         wandb_available = False
         logger.info("Wandb logging disabled.")
     elif wandb_available:
-        try:
-            if not os.getenv("WANDB_API_KEY"):
-                wandb.login()
-            else:
-                wandb.login(key=os.getenv("WANDB_API_KEY"))
-            config_name = f"{os.path.basename(os.path.dirname(args.cfg))}/{os.path.basename(args.cfg)}"
-            wandb.init(project='MTLoRA', config=config,
-                       name=config_name if not args.run_name else args.run_name)
-            wandb.config.update({'args': vars(args)})
-        except wandb.exc.LaunchError:
-            logger.warnning("Could not initialize wandb. Logging is disabled.")
+        if dist.get_rank() == 0:
+            try:
+                if not os.getenv("WANDB_API_KEY"):
+                    wandb.login()
+                else:
+                    wandb.login(key=os.getenv("WANDB_API_KEY"))
+                config_name = f"{os.path.basename(os.path.dirname(args.cfg))}/{os.path.basename(args.cfg)}"
+                wandb.init(project='MTLoRA', config=config,
+                           name=config_name if not args.run_name else args.run_name)
+                wandb.config.update({'args': vars(args)})
+            except wandb.exc.LaunchError:
+                logger.warning("Could not initialize wandb. Logging is disabled.")
+                wandb_available = False
+        else:
             wandb_available = False
 
     main(config)
