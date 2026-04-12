@@ -62,9 +62,16 @@ def _get_layer_rank(mtlora, layer_idx, with_task_lora=False):
     return shared_rank
 
 
-def _get_task_to_group(mtlora):
+def _get_task_to_group(mtlora, layer_idx=None):
     if getattr(mtlora, "AGMTLORA_ENABLED", False):
-        return dict(mtlora.AGMTLORA_TASK_TO_GROUP)
+        task_to_group_by_stage = getattr(mtlora, "AGMTLORA_TASK_TO_GROUP_BY_STAGE", None)
+        if task_to_group_by_stage and layer_idx is not None:
+            stage_key = f"stage_{int(layer_idx)}"
+            if stage_key in task_to_group_by_stage:
+                stage_mapping = task_to_group_by_stage[stage_key]
+                return dict(stage_mapping.items()) if hasattr(stage_mapping, "items") else dict(stage_mapping)
+        global_mapping = getattr(mtlora, "AGMTLORA_TASK_TO_GROUP", {})
+        return dict(global_mapping.items()) if hasattr(global_mapping, "items") else dict(global_mapping)
     return None
 
 
@@ -90,7 +97,7 @@ class Mlp(nn.Module):
                 lora_task_scale=mtlora.SCALE_PER_TASK_LIST[layer_idx],
                 lora_dropout=mtlora.DROPOUT[layer_idx],
                 tasks=route_tasks,
-                task_to_group=_get_task_to_group(mtlora),
+                task_to_group=_get_task_to_group(mtlora, layer_idx),
                 trainable_scale_shared=mtlora.TRAINABLE_SCALE_SHARED,
                 trainable_scale_per_task=mtlora.TRAINABLE_SCALE_PER_TASK,
                 shared_mode=mtlora.SHARED_MODE,
@@ -108,7 +115,7 @@ class Mlp(nn.Module):
                 lora_task_scale=mtlora.SCALE_PER_TASK_LIST[layer_idx],
                 lora_dropout=mtlora.DROPOUT[layer_idx],
                 tasks=route_tasks,
-                task_to_group=_get_task_to_group(mtlora),
+                task_to_group=_get_task_to_group(mtlora, layer_idx),
                 trainable_scale_shared=mtlora.TRAINABLE_SCALE_SHARED,
                 trainable_scale_per_task=mtlora.TRAINABLE_SCALE_PER_TASK,
                 shared_mode=mtlora.SHARED_MODE,
@@ -227,7 +234,7 @@ class WindowAttention(nn.Module):
                     lora_task_scale=mtlora.SCALE_PER_TASK_LIST[layer_idx],
                     lora_dropout=mtlora.DROPOUT[layer_idx],
                     tasks=qkv_tasks,
-                    task_to_group=_get_task_to_group(mtlora),
+                    task_to_group=_get_task_to_group(mtlora, layer_idx),
                     trainable_scale_shared=mtlora.TRAINABLE_SCALE_SHARED,
                     trainable_scale_per_task=mtlora.TRAINABLE_SCALE_PER_TASK,
                     shared_mode=mtlora.SHARED_MODE,
@@ -243,7 +250,7 @@ class WindowAttention(nn.Module):
                     lora_task_scale=mtlora.SCALE_PER_TASK_LIST[layer_idx],
                     lora_dropout=mtlora.DROPOUT[layer_idx],
                     tasks=qkv_tasks,
-                    task_to_group=_get_task_to_group(mtlora),
+                    task_to_group=_get_task_to_group(mtlora, layer_idx),
                     bias=qkv_bias,
                     trainable_scale_shared=mtlora.TRAINABLE_SCALE_SHARED,
                     trainable_scale_per_task=mtlora.TRAINABLE_SCALE_PER_TASK,
@@ -266,7 +273,7 @@ class WindowAttention(nn.Module):
                 lora_task_scale=mtlora.SCALE_PER_TASK_LIST[layer_idx],
                 lora_dropout=mtlora.DROPOUT[layer_idx],
                 tasks=proj_route_tasks,
-                task_to_group=_get_task_to_group(mtlora),
+                task_to_group=_get_task_to_group(mtlora, layer_idx),
                 trainable_scale_shared=mtlora.TRAINABLE_SCALE_SHARED,
                 trainable_scale_per_task=mtlora.TRAINABLE_SCALE_PER_TASK,
                 shared_mode=mtlora.SHARED_MODE,

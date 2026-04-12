@@ -14,11 +14,16 @@ from torch.utils.data import Subset
 from yacs.config import CfgNode as CN
 
 from ag_mtlora.config_utils import (
+    DEFAULT_PARTITION_GRANULARITY,
+    build_task_to_group_by_stage,
     build_task_to_group,
     canonicalize_groups,
     enumerate_candidate_groups,
     enumerate_partitions,
+    group_display_name,
+    normalize_partition_granularity,
     resolve_group_shared_ranks,
+    resolve_stagewise_group_shared_ranks,
     select_predictor_train_groups,
 )
 from data import build_loader
@@ -50,6 +55,7 @@ DEFAULT_TASK_LOSS_WEIGHTS = {
 PREDICTOR_PROGRESS_FILENAME = "predictor_progress.json"
 DEFAULT_SEARCH_SCORE_SOURCE = "final_predictions"
 SUPPORTED_SEARCH_SCORE_SOURCES = {"final_predictions", "group_proxy"}
+SHARED_PARAM_STAGE_PATTERN = re.compile(r"backbone\.layers\.(\d+)\.")
 
 
 def group_to_key(group: Sequence[str]) -> str:
@@ -72,11 +78,20 @@ def get_search_score_source(config: CN) -> str:
     )
 
 
+def get_partition_granularity(config: CN) -> str:
+    return normalize_partition_granularity(
+        getattr(config.MODEL.AGMTLORA, "PARTITION_GRANULARITY", DEFAULT_PARTITION_GRANULARITY)
+    )
+
+
 def append_search_score_suffix(path: str, search_score_source: str) -> str:
     source = normalize_search_score_source(search_score_source)
     if source == DEFAULT_SEARCH_SCORE_SOURCE:
         return path
     root, ext = os.path.splitext(path)
+    source_suffix = f"__{source}"
+    if root.endswith(source_suffix):
+        return path
     return f"{root}__{source}{ext}"
 
 
@@ -136,6 +151,27 @@ def maybe_log_progress(logger, phase: str, step_idx: int, total_steps: int, log_
 
 def round_value_map(values: Dict[str, float], digits: int = 6) -> Dict[str, float]:
     return {key: round(float(value), digits) for key, value in values.items()}
+
+
+def average_search_scores_by_stage(
+    search_scores_by_stage: Sequence[Dict[str, Dict[str, float]]],
+) -> Dict[str, Dict[str, float]]:
+    aggregated = {}
+    counts = {}
+    for stage_scores in search_scores_by_stage:
+        for group_key, group_values in stage_scores.items():
+            aggregated.setdefault(group_key, {})
+            counts.setdefault(group_key, {})
+            for task, value in group_values.items():
+                aggregated[group_key][task] = aggregated[group_key].get(task, 0.0) + float(value)
+                counts[group_key][task] = counts[group_key].get(task, 0) + 1
+    return {
+        group_key: {
+            task: float(total / max(counts[group_key][task], 1))
+            for task, total in group_values.items()
+        }
+        for group_key, group_values in aggregated.items()
+    }
 
 
 def get_affinity_warmup_epochs(config: CN) -> int:
@@ -224,6 +260,25 @@ def save_partition_csv(ranked_partitions: List[Dict], output_path: str) -> None:
                     json.dumps(item["per_task_scores"], ensure_ascii=False),
                 ]
             )
+
+
+def save_stage_partition_csv(ranked_partitions_by_stage: Sequence[Sequence[Dict]], output_path: str) -> None:
+    mkdir_if_missing(os.path.dirname(output_path))
+    with open(output_path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["stage", "rank", "partition_score", "num_groups", "groups", "per_task_scores"])
+        for stage_idx, ranked_partitions in enumerate(ranked_partitions_by_stage):
+            for rank, item in enumerate(ranked_partitions, start=1):
+                writer.writerow(
+                    [
+                        stage_idx,
+                        rank,
+                        float(item["partition_score"]),
+                        int(item["num_groups"]),
+                        json.dumps(item["groups"], ensure_ascii=False),
+                        json.dumps(item["per_task_scores"], ensure_ascii=False),
+                    ]
+                )
 
 
 def get_selection_data_split_mode(config: CN, data_split_manifest: Dict = None) -> str:
@@ -349,6 +404,7 @@ def save_predictor_progress(
 
 
 def maybe_load_affinity_result_from_existing_artifacts(config: CN, output_root: str, logger):
+    partition_granularity = get_partition_granularity(config)
     affinity_json_path = config.MODEL.AGMTLORA.AFFINITY_SAVE_PATH
     affinity_epoch_history_json = os.path.join(os.path.dirname(affinity_json_path), "affinity_epoch_history.json")
     warmup_checkpoint_path = os.path.join(output_root, "warmup_checkpoint.pth")
@@ -365,6 +421,13 @@ def maybe_load_affinity_result_from_existing_artifacts(config: CN, output_root: 
     affinity_payload = load_json(affinity_json_path)
     epoch_history_payload = load_json(affinity_epoch_history_json)
     directed_affinity = np.asarray(affinity_payload["directed_affinity"], dtype=np.float32)
+    directed_affinity_by_stage_payload = affinity_payload.get("directed_affinity_by_stage", [])
+    if partition_granularity == "stage" and not directed_affinity_by_stage_payload:
+        return None
+    directed_affinity_by_stage = [
+        np.asarray(matrix, dtype=np.float32)
+        for matrix in directed_affinity_by_stage_payload
+    ]
     affinity_epoch_history = [
         np.asarray(matrix, dtype=np.float32)
         for matrix in epoch_history_payload.get("epoch_directed_affinity", [])
@@ -384,6 +447,7 @@ def maybe_load_affinity_result_from_existing_artifacts(config: CN, output_root: 
         "post_affinity_state_dict": post_affinity_checkpoint["model"],
         "post_affinity_validation_losses": affinity_payload.get("post_affinity_validation_losses", {}),
         "directed_affinity": directed_affinity,
+        "directed_affinity_by_stage": directed_affinity_by_stage,
         "symmetric_affinity": 0.5 * (directed_affinity + directed_affinity.T),
         "affinity_epoch_history": affinity_epoch_history,
         "num_batches_per_epoch": list(affinity_payload.get("num_batches_per_epoch", [])),
@@ -551,10 +615,12 @@ def rebuild_task_config(base_config: CN, tasks: Sequence[str], output_dir: str =
     config.MODEL.AGMTLORA.ENABLED = False
     config.MODEL.MTLORA.AGMTLORA_ENABLED = False
     config.MODEL.MTLORA.AGMTLORA_STAGE = 0
+    config.MODEL.MTLORA.AGMTLORA_PARTITION_GRANULARITY = "global"
     config.MODEL.MTLORA.AGMTLORA_GROUPS = []
     config.MODEL.MTLORA.AGMTLORA_GROUP_NAMES = []
     config.MODEL.MTLORA.AGMTLORA_GROUP_RANKS = []
     config.MODEL.MTLORA.AGMTLORA_TASK_TO_GROUP = CN(new_allowed=True)
+    config.MODEL.MTLORA.AGMTLORA_TASK_TO_GROUP_BY_STAGE = CN(new_allowed=True)
 
     if output_dir is not None:
         config.OUTPUT = output_dir
@@ -724,6 +790,32 @@ def get_shared_ta_parameters(model: nn.Module):
     return params
 
 
+def get_shared_ta_parameters_and_stage_slices(model: nn.Module, num_stages: int):
+    params = []
+    stage_slices = [[] for _ in range(int(num_stages))]
+    flat_offset = 0
+    for name, param in model.named_parameters():
+        if "backbone" not in name:
+            continue
+        if "lora_shared_" not in name:
+            continue
+        if "groups" in name:
+            continue
+        match = SHARED_PARAM_STAGE_PATTERN.search(name)
+        if match is None:
+            raise ValueError(f"Could not infer the Swin stage for shared TA-LoRA parameter: {name}")
+        stage_idx = int(match.group(1))
+        if stage_idx >= int(num_stages):
+            raise ValueError(
+                f"Shared TA-LoRA parameter {name} resolved to stage {stage_idx}, "
+                f"which exceeds the configured stage count {num_stages}."
+            )
+        params.append(param)
+        stage_slices[stage_idx].append(slice(flat_offset, flat_offset + int(param.numel())))
+        flat_offset += int(param.numel())
+    return params, stage_slices
+
+
 def flatten_gradient_list(params, grads):
     flattened = []
     for param, grad in zip(params, grads):
@@ -732,6 +824,13 @@ def flatten_gradient_list(params, grads):
         else:
             flattened.append(grad.detach().reshape(-1))
     return torch.cat(flattened, dim=0)
+
+
+def dot_on_flat_slices(lhs: torch.Tensor, rhs: torch.Tensor, slices: Sequence[slice]) -> torch.Tensor:
+    total = lhs.new_zeros(())
+    for flat_slice in slices:
+        total = total + torch.dot(lhs[flat_slice], rhs[flat_slice])
+    return total
 
 
 def build_pseudo_update(flat_grad: torch.Tensor, optimizer) -> torch.Tensor:
@@ -760,6 +859,8 @@ def build_pseudo_update(flat_grad: torch.Tensor, optimizer) -> torch.Tensor:
 
 def warmup_and_collect_affinity(config: CN, logger, working_dir: str, data_split_manifest: Dict = None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    partition_granularity = get_partition_granularity(config)
+    num_stages = len(config.MODEL.SWIN.DEPTHS)
     dataset_train, dataset_val, data_loader_train, data_loader_val, _ = build_stage1_data_loaders(
         config,
         data_split_manifest=data_split_manifest,
@@ -826,6 +927,7 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str, data_split
                 "tasks": list(config.TASKS),
                 "affinity_warmup_epochs": warmup_epochs,
                 "affinity_score_epochs": affinity_score_epochs,
+                "partition_granularity": partition_granularity,
                 "selection_data_split_mode": selection_data_split_mode,
                 "meta_split_path": meta_split_path,
             },
@@ -839,9 +941,17 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str, data_split
         round_value_map(warmup_validation_losses),
     )
 
-    shared_params = get_shared_ta_parameters(model)
+    if partition_granularity == "stage":
+        shared_params, shared_param_stage_slices = get_shared_ta_parameters_and_stage_slices(
+            model,
+            num_stages,
+        )
+    else:
+        shared_params = get_shared_ta_parameters(model)
+        shared_param_stage_slices = None
     task_index = {task: idx for idx, task in enumerate(config.TASKS)}
     affinity_epoch_history = []
+    affinity_epoch_history_by_stage = []
     num_batches_per_epoch = []
 
     logger.info(
@@ -856,6 +966,12 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str, data_split
     for affinity_epoch_idx in range(affinity_score_epochs):
         logger.info("Affinity epoch %d/%d started", affinity_epoch_idx + 1, affinity_score_epochs)
         epoch_directed_sum = torch.zeros((len(config.TASKS), len(config.TASKS)), dtype=torch.float32, device=device)
+        epoch_directed_sum_by_stage = None
+        if partition_granularity == "stage":
+            epoch_directed_sum_by_stage = [
+                torch.zeros((len(config.TASKS), len(config.TASKS)), dtype=torch.float32, device=device)
+                for _ in range(num_stages)
+            ]
         epoch_batches = 0
         model.train()
         for batch_idx, batch in enumerate(data_loader_train, start=1):
@@ -882,9 +998,18 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str, data_split
                 src_idx = task_index[src_task]
                 for dst_task in config.TASKS:
                     dst_idx = task_index[dst_task]
-                    epoch_directed_sum[src_idx, dst_idx] += torch.dot(
-                        flat_gradients[dst_task], pseudo_updates[src_task]
-                    ) / max(lr, 1e-12)
+                    dot_value = torch.dot(flat_gradients[dst_task], pseudo_updates[src_task])
+                    epoch_directed_sum[src_idx, dst_idx] += dot_value / max(lr, 1e-12)
+                    if epoch_directed_sum_by_stage is not None:
+                        for stage_idx, flat_slices in enumerate(shared_param_stage_slices):
+                            epoch_directed_sum_by_stage[stage_idx][src_idx, dst_idx] += (
+                                dot_on_flat_slices(
+                                    flat_gradients[dst_task],
+                                    pseudo_updates[src_task],
+                                    flat_slices,
+                                )
+                                / max(lr, 1e-12)
+                            )
             epoch_batches += 1
 
             loss, _ = criterion(outputs, targets)
@@ -900,6 +1025,12 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str, data_split
             )
 
         epoch_directed_affinity = (epoch_directed_sum / max(float(epoch_batches), 1.0)).detach().cpu().numpy()
+        if epoch_directed_sum_by_stage is not None:
+            epoch_directed_affinity_by_stage = [
+                (stage_sum / max(float(epoch_batches), 1.0)).detach().cpu().numpy()
+                for stage_sum in epoch_directed_sum_by_stage
+            ]
+            affinity_epoch_history_by_stage.append(epoch_directed_affinity_by_stage)
         affinity_epoch_history.append(epoch_directed_affinity)
         num_batches_per_epoch.append(int(epoch_batches))
         epoch_matrix_stats = {
@@ -920,6 +1051,21 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str, data_split
         directed_affinity = np.mean(np.stack(affinity_epoch_history, axis=0), axis=0)
     else:
         directed_affinity = np.zeros((len(config.TASKS), len(config.TASKS)), dtype=np.float32)
+    if affinity_epoch_history_by_stage:
+        directed_affinity_by_stage = [
+            np.mean(
+                np.stack([epoch_stage_affinity[stage_idx] for epoch_stage_affinity in affinity_epoch_history_by_stage], axis=0),
+                axis=0,
+            )
+            for stage_idx in range(num_stages)
+        ]
+    elif partition_granularity == "stage":
+        directed_affinity_by_stage = [
+            np.zeros((len(config.TASKS), len(config.TASKS)), dtype=np.float32)
+            for _ in range(num_stages)
+        ]
+    else:
+        directed_affinity_by_stage = []
     symmetric_affinity = 0.5 * (directed_affinity + directed_affinity.T)
     post_affinity_validation_losses = evaluate_task_losses(model, data_loader_val, loss_ft, config.TASKS, device)
     post_affinity_state_dict = clone_state_dict_to_cpu(model)
@@ -933,6 +1079,7 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str, data_split
                 "tasks": list(config.TASKS),
                 "affinity_warmup_epochs": warmup_epochs,
                 "affinity_score_epochs": affinity_score_epochs,
+                "partition_granularity": partition_granularity,
                 "selection_data_split_mode": selection_data_split_mode,
                 "meta_split_path": meta_split_path,
             },
@@ -961,6 +1108,7 @@ def warmup_and_collect_affinity(config: CN, logger, working_dir: str, data_split
         "post_affinity_state_dict": post_affinity_state_dict,
         "post_affinity_validation_losses": post_affinity_validation_losses,
         "directed_affinity": directed_affinity,
+        "directed_affinity_by_stage": directed_affinity_by_stage,
         "symmetric_affinity": symmetric_affinity,
         "affinity_epoch_history": affinity_epoch_history,
         "num_batches_per_epoch": num_batches_per_epoch,
@@ -1274,7 +1422,23 @@ def run_partition_search(tasks: Sequence[str], search_scores: Dict[str, Dict[str
     return ranked_results
 
 
-def create_resolved_training_config(base_cfg_path: str, grouping_json_path: str, resolved_group_ranks: List[List[int]]) -> CN:
+def run_stagewise_partition_search(
+    tasks: Sequence[str],
+    search_scores_by_stage: Sequence[Dict[str, Dict[str, float]]],
+    max_groups: int,
+) -> List[List[Dict]]:
+    return [
+        run_partition_search(tasks, stage_search_scores, max_groups)
+        for stage_search_scores in search_scores_by_stage
+    ]
+
+
+def create_resolved_training_config(
+    base_cfg_path: str,
+    grouping_json_path: str,
+    resolved_group_ranks: List[List[int]],
+    partition_granularity: str = DEFAULT_PARTITION_GRANULARITY,
+) -> CN:
     if not base_cfg_path:
         raise ValueError("AG-MTLoRA Stage-1 requires the original --cfg path to build a reusable training override.")
 
@@ -1284,6 +1448,9 @@ def create_resolved_training_config(base_cfg_path: str, grouping_json_path: str,
     resolved_config.MODEL.AGMTLORA = CN(new_allowed=True)
     resolved_config.MODEL.AGMTLORA.ENABLED = True
     resolved_config.MODEL.AGMTLORA.STAGE = 1
+    resolved_config.MODEL.AGMTLORA.PARTITION_GRANULARITY = normalize_partition_granularity(
+        partition_granularity
+    )
     resolved_config.MODEL.AGMTLORA.GROUPING_SOURCE = "fixed_json"
     resolved_config.MODEL.AGMTLORA.GROUPING_JSON = os.path.abspath(grouping_json_path)
     resolved_config.MODEL.AGMTLORA.GROUP_SHARED_RANKS = [
@@ -1297,7 +1464,7 @@ def create_resolved_training_config(base_cfg_path: str, grouping_json_path: str,
 def write_search_artifacts(
     *,
     tasks: Sequence[str],
-    search_scores: Dict[str, Dict[str, float]],
+    search_scores,
     search_score_source: str,
     search_score_path: str,
     output_root: str,
@@ -1320,73 +1487,159 @@ def write_search_artifacts(
     base_cfg_path: str,
     runtime_snapshot_text: str,
     logger,
+    partition_granularity: str = DEFAULT_PARTITION_GRANULARITY,
 ) -> Dict[str, object]:
     search_score_source = normalize_search_score_source(search_score_source)
+    partition_granularity = normalize_partition_granularity(partition_granularity)
     artifact_paths = build_search_artifact_paths(output_root, grouping_save_path, search_score_source)
-    ranked_partitions = run_partition_search(tasks, search_scores, int(max_groups))
-    logger.info(
-        "Partition search finished | search_score_source=%s | max_groups=%d | num_partitions=%d | best_groups=%s | best_score=%.6f",
-        search_score_source,
-        int(max_groups),
-        len(ranked_partitions),
-        ranked_partitions[0]["groups"],
-        float(ranked_partitions[0]["partition_score"]),
-    )
 
-    save_json(
-        {
+    if partition_granularity == "stage":
+        if search_score_source != "group_proxy":
+            raise ValueError("Stage-wise partition artifacts currently require search_score_source='group_proxy'.")
+        if not isinstance(search_scores, (list, tuple)):
+            raise ValueError("Stage-wise partition search expects a per-stage list of search score tables.")
+
+        ranked_partitions_by_stage = run_stagewise_partition_search(tasks, search_scores, int(max_groups))
+        best_partition_by_stage = [ranked_partitions[0] for ranked_partitions in ranked_partitions_by_stage]
+        group_slot_names = [group_display_name(group_idx) for group_idx in range(int(max_groups))]
+        groups_by_stage = [best_partition["groups"] for best_partition in best_partition_by_stage]
+        task_to_group_by_stage = build_task_to_group_by_stage(groups_by_stage, group_slot_names)
+        num_groups_by_stage = [len(groups) for groups in groups_by_stage]
+        resolved_group_ranks, rank_source = resolve_stagewise_group_shared_ranks(
+            group_shared_ranks,
+            int(total_shared_rank_budget),
+            int(max_groups),
+            num_groups_by_stage,
+            int(num_stages),
+            str(group_rank_allocation),
+        )
+        logger.info(
+            "Stage-wise partition search finished | search_score_source=%s | max_groups=%d | best_groups_by_stage=%s | best_scores_by_stage=%s",
+            search_score_source,
+            int(max_groups),
+            groups_by_stage,
+            [float(best_partition["partition_score"]) for best_partition in best_partition_by_stage],
+        )
+
+        save_json(
+            {
+                "tasks": list(tasks),
+                "partition_granularity": partition_granularity,
+                "group_slot_names": group_slot_names,
+                "selection_data_split_mode": selection_data_split_mode,
+                "selection_eval_label": selection_eval_label,
+                "meta_split_path": meta_split_path,
+                "search_objective": str(search_objective),
+                "search_score_source": search_score_source,
+                "search_score_path": search_score_path,
+                "ranked_partitions_by_stage": ranked_partitions_by_stage,
+            },
+            artifact_paths["partition_results_path"],
+        )
+        save_stage_partition_csv(ranked_partitions_by_stage, artifact_paths["partition_results_csv"])
+
+        grouping_payload = {
             "tasks": list(tasks),
-            "selection_data_split_mode": selection_data_split_mode,
-            "selection_eval_label": selection_eval_label,
-            "meta_split_path": meta_split_path,
+            "partition_granularity": partition_granularity,
+            "group_slot_names": group_slot_names,
+            "groups_by_stage": groups_by_stage,
+            "task_to_group_by_stage": task_to_group_by_stage,
+            "num_groups_by_stage": num_groups_by_stage,
+            "max_groups": int(max_groups),
+            "group_shared_ranks": resolved_group_ranks,
             "search_objective": str(search_objective),
             "search_score_source": search_score_source,
             "search_score_path": search_score_path,
-            "ranked_partitions": ranked_partitions,
-        },
-        artifact_paths["partition_results_path"],
-    )
-    save_partition_csv(ranked_partitions, artifact_paths["partition_results_csv"])
+            "selection_data_split_mode": selection_data_split_mode,
+            "selection_eval_label": selection_eval_label,
+            "meta_split_path": meta_split_path,
+            "affinity_path": affinity_path,
+            "final_predictions_path": final_predictions_path,
+            "warmup_checkpoint": warmup_checkpoint_path,
+            "post_affinity_checkpoint": post_affinity_checkpoint_path,
+            "affinity_warmup_epochs": int(affinity_warmup_epochs),
+            "affinity_score_epochs": int(affinity_score_epochs),
+            "partition_search_results": artifact_paths["partition_results_path"],
+            "group_rank_source": rank_source,
+        }
+        save_json(grouping_payload, artifact_paths["grouping_json_path"])
+        logger.info("Grouping saved to %s", artifact_paths["grouping_json_path"])
 
-    best_partition = ranked_partitions[0]
-    resolved_group_ranks, rank_source = resolve_group_shared_ranks(
-        group_shared_ranks,
-        int(total_shared_rank_budget),
-        len(best_partition["groups"]),
-        int(num_stages),
-        str(group_rank_allocation),
-    )
-    task_to_group = build_task_to_group(best_partition["groups"])
-    grouping_payload = {
-        "tasks": list(tasks),
-        "groups": best_partition["groups"],
-        "task_to_group": task_to_group,
-        "max_groups": int(max_groups),
-        "partition_score": float(best_partition["partition_score"]),
-        "group_shared_ranks": resolved_group_ranks,
-        "search_objective": str(search_objective),
-        "search_score_source": search_score_source,
-        "search_score_path": search_score_path,
-        "selection_data_split_mode": selection_data_split_mode,
-        "selection_eval_label": selection_eval_label,
-        "meta_split_path": meta_split_path,
-        "affinity_path": affinity_path,
-        "final_predictions_path": final_predictions_path,
-        "warmup_checkpoint": warmup_checkpoint_path,
-        "post_affinity_checkpoint": post_affinity_checkpoint_path,
-        "affinity_warmup_epochs": int(affinity_warmup_epochs),
-        "affinity_score_epochs": int(affinity_score_epochs),
-        "partition_search_results": artifact_paths["partition_results_path"],
-        "group_rank_source": rank_source,
-    }
-    save_json(grouping_payload, artifact_paths["grouping_json_path"])
-    logger.info("Grouping saved to %s", artifact_paths["grouping_json_path"])
+        resolved_config = create_resolved_training_config(
+            base_cfg_path,
+            artifact_paths["grouping_json_path"],
+            resolved_group_ranks,
+            partition_granularity=partition_granularity,
+        )
+    else:
+        ranked_partitions = run_partition_search(tasks, search_scores, int(max_groups))
+        logger.info(
+            "Partition search finished | search_score_source=%s | max_groups=%d | num_partitions=%d | best_groups=%s | best_score=%.6f",
+            search_score_source,
+            int(max_groups),
+            len(ranked_partitions),
+            ranked_partitions[0]["groups"],
+            float(ranked_partitions[0]["partition_score"]),
+        )
 
-    resolved_config = create_resolved_training_config(
-        base_cfg_path,
-        artifact_paths["grouping_json_path"],
-        resolved_group_ranks,
-    )
+        save_json(
+            {
+                "tasks": list(tasks),
+                "partition_granularity": partition_granularity,
+                "selection_data_split_mode": selection_data_split_mode,
+                "selection_eval_label": selection_eval_label,
+                "meta_split_path": meta_split_path,
+                "search_objective": str(search_objective),
+                "search_score_source": search_score_source,
+                "search_score_path": search_score_path,
+                "ranked_partitions": ranked_partitions,
+            },
+            artifact_paths["partition_results_path"],
+        )
+        save_partition_csv(ranked_partitions, artifact_paths["partition_results_csv"])
+
+        best_partition = ranked_partitions[0]
+        resolved_group_ranks, rank_source = resolve_group_shared_ranks(
+            group_shared_ranks,
+            int(total_shared_rank_budget),
+            len(best_partition["groups"]),
+            int(num_stages),
+            str(group_rank_allocation),
+        )
+        task_to_group = build_task_to_group(best_partition["groups"])
+        grouping_payload = {
+            "tasks": list(tasks),
+            "partition_granularity": partition_granularity,
+            "groups": best_partition["groups"],
+            "task_to_group": task_to_group,
+            "max_groups": int(max_groups),
+            "partition_score": float(best_partition["partition_score"]),
+            "group_shared_ranks": resolved_group_ranks,
+            "search_objective": str(search_objective),
+            "search_score_source": search_score_source,
+            "search_score_path": search_score_path,
+            "selection_data_split_mode": selection_data_split_mode,
+            "selection_eval_label": selection_eval_label,
+            "meta_split_path": meta_split_path,
+            "affinity_path": affinity_path,
+            "final_predictions_path": final_predictions_path,
+            "warmup_checkpoint": warmup_checkpoint_path,
+            "post_affinity_checkpoint": post_affinity_checkpoint_path,
+            "affinity_warmup_epochs": int(affinity_warmup_epochs),
+            "affinity_score_epochs": int(affinity_score_epochs),
+            "partition_search_results": artifact_paths["partition_results_path"],
+            "group_rank_source": rank_source,
+        }
+        save_json(grouping_payload, artifact_paths["grouping_json_path"])
+        logger.info("Grouping saved to %s", artifact_paths["grouping_json_path"])
+
+        resolved_config = create_resolved_training_config(
+            base_cfg_path,
+            artifact_paths["grouping_json_path"],
+            resolved_group_ranks,
+            partition_granularity=partition_granularity,
+        )
+
     mkdir_if_missing(os.path.dirname(artifact_paths["resolved_config_path"]))
     with open(artifact_paths["resolved_config_path"], "w", encoding="utf-8") as handle:
         handle.write(resolved_config.dump())
@@ -1398,13 +1651,19 @@ def write_search_artifacts(
         artifact_paths["resolved_runtime_snapshot_path"],
     )
 
-    return {
-        "ranked_partitions": ranked_partitions,
-        "best_partition": best_partition,
+    result = {
+        "partition_granularity": partition_granularity,
         "group_rank_source": rank_source,
         "resolved_group_ranks": resolved_group_ranks,
         **artifact_paths,
     }
+    if partition_granularity == "stage":
+        result["ranked_partitions_by_stage"] = ranked_partitions_by_stage
+        result["best_partition_by_stage"] = best_partition_by_stage
+    else:
+        result["ranked_partitions"] = ranked_partitions
+        result["best_partition"] = best_partition
+    return result
 
 
 def compare_partition_rankings(
@@ -1438,6 +1697,29 @@ def compare_partition_rankings(
     return ranking_changes
 
 
+def compare_partition_rankings_by_stage(
+    original_ranked_partitions_by_stage: Sequence[Sequence[Dict]],
+    replay_ranked_partitions_by_stage: Sequence[Sequence[Dict]],
+) -> List[List[Dict[str, object]]]:
+    num_stages = max(len(original_ranked_partitions_by_stage), len(replay_ranked_partitions_by_stage))
+    ranking_changes_by_stage = []
+    for stage_idx in range(num_stages):
+        original_ranked_partitions = (
+            original_ranked_partitions_by_stage[stage_idx]
+            if stage_idx < len(original_ranked_partitions_by_stage)
+            else []
+        )
+        replay_ranked_partitions = (
+            replay_ranked_partitions_by_stage[stage_idx]
+            if stage_idx < len(replay_ranked_partitions_by_stage)
+            else []
+        )
+        ranking_changes_by_stage.append(
+            compare_partition_rankings(original_ranked_partitions, replay_ranked_partitions)
+        )
+    return ranking_changes_by_stage
+
+
 def replay_stage1_partition_search(
     *,
     base_cfg_path: str,
@@ -1456,10 +1738,28 @@ def replay_stage1_partition_search(
     group_proxy_json_path = os.path.join(stage1_dir, "group_proxy.json")
     final_predictions_json_path = os.path.join(stage1_dir, "final_predictions.json")
 
+    if search_score_source != DEFAULT_SEARCH_SCORE_SOURCE:
+        candidate_grouping_path = append_search_score_suffix(grouping_json_path, search_score_source)
+        candidate_runtime_snapshot_path = append_search_score_suffix(runtime_snapshot_path, search_score_source)
+        candidate_partition_results_path = append_search_score_suffix(partition_results_path, search_score_source)
+        if os.path.exists(candidate_grouping_path):
+            grouping_json_path = candidate_grouping_path
+        if os.path.exists(candidate_runtime_snapshot_path):
+            runtime_snapshot_path = candidate_runtime_snapshot_path
+        if os.path.exists(candidate_partition_results_path):
+            partition_results_path = candidate_partition_results_path
+
     if not os.path.exists(grouping_json_path):
         raise FileNotFoundError(f"Missing Stage-1 grouping artifact: {grouping_json_path}")
     if not os.path.exists(runtime_snapshot_path):
         raise FileNotFoundError(f"Missing Stage-1 runtime snapshot artifact: {runtime_snapshot_path}")
+
+    grouping_payload = load_json(grouping_json_path)
+    partition_granularity = normalize_partition_granularity(
+        grouping_payload.get("partition_granularity", DEFAULT_PARTITION_GRANULARITY)
+    )
+    if partition_granularity == "stage" and search_score_source != "group_proxy":
+        raise ValueError("Stage-wise replay search only supports search_score_source='group_proxy'.")
 
     score_file_path = (
         group_proxy_json_path
@@ -1471,7 +1771,6 @@ def replay_stage1_partition_search(
             f"Missing Stage-1 score artifact for source '{search_score_source}': {score_file_path}"
         )
 
-    grouping_payload = load_json(grouping_json_path)
     score_payload = load_json(score_file_path)
     original_partition_payload = (
         load_json(partition_results_path) if os.path.exists(partition_results_path) else {}
@@ -1483,17 +1782,25 @@ def replay_stage1_partition_search(
     if not tasks:
         raise ValueError("Replay search could not determine the Stage-1 task list.")
 
-    score_key = "group_proxy" if search_score_source == "group_proxy" else "final_predictions"
-    search_scores = score_payload.get(score_key)
-    if not isinstance(search_scores, dict):
-        raise ValueError(
-            f"Replay search expected '{score_key}' in {score_file_path}, but it was not found."
-        )
+    if partition_granularity == "stage":
+        search_scores = score_payload.get("group_proxy_by_stage")
+        if not isinstance(search_scores, list):
+            raise ValueError(
+                f"Replay search expected 'group_proxy_by_stage' in {score_file_path}, but it was not found."
+            )
+    else:
+        score_key = "group_proxy" if search_score_source == "group_proxy" else "final_predictions"
+        search_scores = score_payload.get(score_key)
+        if not isinstance(search_scores, dict):
+            raise ValueError(
+                f"Replay search expected '{score_key}' in {score_file_path}, but it was not found."
+            )
 
     model_payload = runtime_payload.get("MODEL", {})
     agmtlora_payload = model_payload.get("AGMTLORA", {})
     swin_payload = model_payload.get("SWIN", {})
     agmtlora_payload["SEARCH_SCORE_SOURCE"] = search_score_source
+    agmtlora_payload["PARTITION_GRANULARITY"] = partition_granularity
     model_payload["AGMTLORA"] = agmtlora_payload
     runtime_payload["MODEL"] = model_payload
 
@@ -1539,29 +1846,53 @@ def replay_stage1_partition_search(
         base_cfg_path=base_cfg_path,
         runtime_snapshot_text=yaml.safe_dump(runtime_payload, sort_keys=False),
         logger=logger,
+        partition_granularity=partition_granularity,
     )
 
-    original_ranked_partitions = original_partition_payload.get("ranked_partitions", [])
-    ranking_changes = compare_partition_rankings(
-        original_ranked_partitions,
-        search_result["ranked_partitions"],
-    )
-    if original_ranked_partitions:
-        logger.info(
-            "Replay search comparison | original_best=%s | original_score=%.6f | replay_best=%s | replay_score=%.6f",
-            original_ranked_partitions[0]["groups"],
-            float(original_ranked_partitions[0]["partition_score"]),
-            search_result["best_partition"]["groups"],
-            float(search_result["best_partition"]["partition_score"]),
+    if partition_granularity == "stage":
+        original_ranked_partitions_by_stage = original_partition_payload.get("ranked_partitions_by_stage", [])
+        ranking_changes_by_stage = compare_partition_rankings_by_stage(
+            original_ranked_partitions_by_stage,
+            search_result["ranked_partitions_by_stage"],
         )
+        if original_ranked_partitions_by_stage:
+            logger.info(
+                "Replay stage-wise search comparison | original_best_by_stage=%s | replay_best_by_stage=%s",
+                [stage_partitions[0]["groups"] for stage_partitions in original_ranked_partitions_by_stage if stage_partitions],
+                [best_partition["groups"] for best_partition in search_result["best_partition_by_stage"]],
+            )
+        ranking_changes = None
+        original_best_partition = (
+            [stage_partitions[0] for stage_partitions in original_ranked_partitions_by_stage]
+            if original_ranked_partitions_by_stage
+            else None
+        )
+    else:
+        original_ranked_partitions = original_partition_payload.get("ranked_partitions", [])
+        ranking_changes = compare_partition_rankings(
+            original_ranked_partitions,
+            search_result["ranked_partitions"],
+        )
+        if original_ranked_partitions:
+            logger.info(
+                "Replay search comparison | original_best=%s | original_score=%.6f | replay_best=%s | replay_score=%.6f",
+                original_ranked_partitions[0]["groups"],
+                float(original_ranked_partitions[0]["partition_score"]),
+                search_result["best_partition"]["groups"],
+                float(search_result["best_partition"]["partition_score"]),
+            )
+        ranking_changes_by_stage = None
+        original_best_partition = original_ranked_partitions[0] if original_ranked_partitions else None
 
     return {
         "stage1_dir": stage1_dir,
+        "partition_granularity": partition_granularity,
         "search_score_source": search_score_source,
         "search_score_path": score_file_path,
         "original_partition_results_path": partition_results_path if os.path.exists(partition_results_path) else None,
-        "original_best_partition": original_ranked_partitions[0] if original_ranked_partitions else None,
+        "original_best_partition": original_best_partition,
         "ranking_changes": ranking_changes,
+        "ranking_changes_by_stage": ranking_changes_by_stage,
         **search_result,
     }
 
@@ -1573,6 +1904,7 @@ def run_stage1_pipeline(config: CN, output_root: str, logger, base_cfg_path: str
     selection_data_split_mode = get_selection_data_split_mode(config, data_split_manifest)
     selection_eval_label = get_selection_eval_label(config, data_split_manifest)
     meta_split_path = None if data_split_manifest is None else data_split_manifest.get("meta_split_path")
+    partition_granularity = get_partition_granularity(config)
 
     affinity_result = maybe_load_affinity_result_from_existing_artifacts(config, output_root, logger)
     if affinity_result is None:
@@ -1583,6 +1915,7 @@ def run_stage1_pipeline(config: CN, output_root: str, logger, base_cfg_path: str
             data_split_manifest=data_split_manifest,
         )
     directed_affinity = affinity_result["directed_affinity"]
+    directed_affinity_by_stage = affinity_result.get("directed_affinity_by_stage", [])
     symmetric_affinity = affinity_result["symmetric_affinity"]
     affinity_warmup_epochs = get_affinity_warmup_epochs(config)
     affinity_score_epochs = get_affinity_score_epochs(config)
@@ -1597,10 +1930,12 @@ def run_stage1_pipeline(config: CN, output_root: str, logger, base_cfg_path: str
     save_json(
         {
             "tasks": list(config.TASKS),
+            "partition_granularity": partition_granularity,
             "selection_data_split_mode": selection_data_split_mode,
             "selection_eval_label": selection_eval_label,
             "meta_split_path": meta_split_path,
             "directed_affinity": directed_affinity.tolist(),
+            "directed_affinity_by_stage": [matrix.tolist() for matrix in directed_affinity_by_stage],
             "num_affinity_epochs": int(affinity_result["num_affinity_epochs"]),
             "num_batches_per_epoch": list(affinity_result["num_batches_per_epoch"]),
             "affinity_epoch_history_path": affinity_epoch_history_json,
@@ -1615,6 +1950,7 @@ def run_stage1_pipeline(config: CN, output_root: str, logger, base_cfg_path: str
     save_json(
         {
             "tasks": list(config.TASKS),
+            "partition_granularity": partition_granularity,
             "selection_data_split_mode": selection_data_split_mode,
             "selection_eval_label": selection_eval_label,
             "meta_split_path": meta_split_path,
@@ -1631,6 +1967,7 @@ def run_stage1_pipeline(config: CN, output_root: str, logger, base_cfg_path: str
         save_json(
             {
                 "tasks": list(config.TASKS),
+                "partition_granularity": partition_granularity,
                 "selection_data_split_mode": selection_data_split_mode,
                 "selection_eval_label": selection_eval_label,
                 "meta_split_path": meta_split_path,
@@ -1642,22 +1979,41 @@ def run_stage1_pipeline(config: CN, output_root: str, logger, base_cfg_path: str
 
     candidate_groups = enumerate_candidate_groups(config.TASKS)
     logger.info("Enumerated candidate groups | num_tasks=%d | num_candidate_groups=%d", len(config.TASKS), len(candidate_groups))
-    group_proxy, group_proxy_rows = build_group_proxy(directed_affinity, config.TASKS, candidate_groups)
+    if partition_granularity == "stage":
+        group_proxy_by_stage = [
+            build_group_proxy(stage_affinity, config.TASKS, candidate_groups)[0]
+            for stage_affinity in directed_affinity_by_stage
+        ]
+        group_proxy = average_search_scores_by_stage(group_proxy_by_stage)
+        group_proxy_rows = [
+            {"group": group_key, "task": task, "proxy": float(value)}
+            for group_key, group_values in group_proxy.items()
+            for task, value in group_values.items()
+        ]
+    else:
+        group_proxy, group_proxy_rows = build_group_proxy(directed_affinity, config.TASKS, candidate_groups)
+        group_proxy_by_stage = []
     group_proxy_json_path = os.path.join(output_root, "group_proxy.json")
     group_proxy_csv_path = os.path.join(output_root, "group_proxy.csv")
     save_json(
         {
             "tasks": list(config.TASKS),
+            "partition_granularity": partition_granularity,
             "selection_data_split_mode": selection_data_split_mode,
             "selection_eval_label": selection_eval_label,
             "meta_split_path": meta_split_path,
             "group_proxy": group_proxy,
+            "group_proxy_by_stage": group_proxy_by_stage,
         },
         group_proxy_json_path,
     )
     save_group_task_rows(group_proxy_rows, group_proxy_csv_path, "proxy")
 
     search_score_source = get_search_score_source(config)
+    if partition_granularity == "stage" and search_score_source != "group_proxy":
+        raise ValueError(
+            "Stage-wise partition search currently requires MODEL.AGMTLORA.SEARCH_SCORE_SOURCE='group_proxy'."
+        )
     predictor_train_groups_json = None
     predictor_train_groups_csv = None
     initial_predictions_json = None
@@ -1669,7 +2025,7 @@ def run_stage1_pipeline(config: CN, output_root: str, logger, base_cfg_path: str
             "Stage-1 Step C skipped | search_score_source=%s | using group_proxy directly for partition search",
             search_score_source,
         )
-        search_scores = group_proxy
+        search_scores = group_proxy_by_stage if partition_granularity == "stage" else group_proxy
         search_score_path = group_proxy_json_path
     else:
         predictor_train_groups = select_predictor_train_groups(
@@ -1841,6 +2197,7 @@ def run_stage1_pipeline(config: CN, output_root: str, logger, base_cfg_path: str
         base_cfg_path=base_cfg_path,
         runtime_snapshot_text=config.dump(),
         logger=logger,
+        partition_granularity=partition_granularity,
     )
 
     return {

@@ -23,8 +23,11 @@ import json
 
 from ag_mtlora.config_utils import (
     load_grouping_json,
+    normalize_partition_granularity,
     resolve_artifact_path,
     resolve_group_shared_ranks,
+    resolve_stagewise_group_shared_ranks,
+    stage_index_to_key,
 )
 
 _C = CN()
@@ -337,14 +340,17 @@ _C.MODEL.MTLORA.FC2_ENABLED = True
 _C.MODEL.MTLORA.DOWNSAMPLER_ENABLED = False
 _C.MODEL.MTLORA.AGMTLORA_ENABLED = False
 _C.MODEL.MTLORA.AGMTLORA_STAGE = 0
+_C.MODEL.MTLORA.AGMTLORA_PARTITION_GRANULARITY = 'global'
 _C.MODEL.MTLORA.AGMTLORA_GROUPS = []
 _C.MODEL.MTLORA.AGMTLORA_GROUP_NAMES = []
 _C.MODEL.MTLORA.AGMTLORA_GROUP_RANKS = []
 _C.MODEL.MTLORA.AGMTLORA_TASK_TO_GROUP = CN(new_allowed=True)
+_C.MODEL.MTLORA.AGMTLORA_TASK_TO_GROUP_BY_STAGE = CN(new_allowed=True)
 
 _C.MODEL.AGMTLORA = CN()
 _C.MODEL.AGMTLORA.ENABLED = False
 _C.MODEL.AGMTLORA.STAGE = 1
+_C.MODEL.AGMTLORA.PARTITION_GRANULARITY = 'global'
 _C.MODEL.AGMTLORA.MAX_GROUPS = 2
 _C.MODEL.AGMTLORA.TOTAL_SHARED_RANK_BUDGET = 64
 _C.MODEL.AGMTLORA.GROUP_SHARED_RANKS = []
@@ -372,11 +378,16 @@ _C.MODEL.AGMTLORA.RESIDUAL_PREDICTOR = 'ridge'
 _C.MODEL.AGMTLORA.RESIDUAL_ALPHA = 1.0
 _C.MODEL.AGMTLORA.VISUALIZE_SYMMETRIC_AFFINITY = True
 _C.MODEL.AGMTLORA.RESOLVED_GROUPS = []
+_C.MODEL.AGMTLORA.RESOLVED_GROUPS_BY_STAGE = []
 _C.MODEL.AGMTLORA.RESOLVED_GROUP_NAMES = []
+_C.MODEL.AGMTLORA.RESOLVED_GROUP_SLOT_NAMES = []
 _C.MODEL.AGMTLORA.RESOLVED_GROUP_SHARED_RANKS = []
 _C.MODEL.AGMTLORA.RESOLVED_GROUP_RANK_SOURCE = ''
 _C.MODEL.AGMTLORA.RESOLVED_NUM_GROUPS = 0
+_C.MODEL.AGMTLORA.RESOLVED_NUM_GROUPS_BY_STAGE = []
+_C.MODEL.AGMTLORA.RESOLVED_PARTITION_GRANULARITY = 'global'
 _C.MODEL.AGMTLORA.RESOLVED_TASK_TO_GROUP = CN(new_allowed=True)
+_C.MODEL.AGMTLORA.RESOLVED_TASK_TO_GROUP_BY_STAGE = CN(new_allowed=True)
 
 def _update_config_from_file(config, cfg_file):
     config.defrost()
@@ -623,10 +634,12 @@ def update_config(config, args):
 
     config.MODEL.MTLORA.AGMTLORA_ENABLED = False
     config.MODEL.MTLORA.AGMTLORA_STAGE = 0
+    config.MODEL.MTLORA.AGMTLORA_PARTITION_GRANULARITY = "global"
     config.MODEL.MTLORA.AGMTLORA_GROUPS = []
     config.MODEL.MTLORA.AGMTLORA_GROUP_NAMES = []
     config.MODEL.MTLORA.AGMTLORA_GROUP_RANKS = []
     config.MODEL.MTLORA.AGMTLORA_TASK_TO_GROUP = CN(new_allowed=True)
+    config.MODEL.MTLORA.AGMTLORA_TASK_TO_GROUP_BY_STAGE = CN(new_allowed=True)
 
     if config.MODEL.AGMTLORA.ENABLED:
         if not config.MODEL.MTLORA.ENABLED:
@@ -647,6 +660,9 @@ def update_config(config, args):
             raise ValueError("MODEL.AGMTLORA.AFFINITY_SCORE_EPOCHS must be >= 0.")
         if str(config.MODEL.AGMTLORA.SEARCH_SCORE_SOURCE) not in {"final_predictions", "group_proxy"}:
             raise ValueError("MODEL.AGMTLORA.SEARCH_SCORE_SOURCE must be one of {'final_predictions', 'group_proxy'}.")
+        config.MODEL.AGMTLORA.PARTITION_GRANULARITY = normalize_partition_granularity(
+            getattr(config.MODEL.AGMTLORA, "PARTITION_GRANULARITY", "global")
+        )
 
         base_output_dir = config.OUTPUT
         config.MODEL.AGMTLORA.AFFINITY_SAVE_PATH = resolve_artifact_path(
@@ -672,6 +688,27 @@ def update_config(config, args):
             )
 
         grouping_payload = None
+        config.MODEL.AGMTLORA.RESOLVED_GROUPS = []
+        config.MODEL.AGMTLORA.RESOLVED_GROUPS_BY_STAGE = []
+        config.MODEL.AGMTLORA.RESOLVED_GROUP_NAMES = []
+        config.MODEL.AGMTLORA.RESOLVED_GROUP_SLOT_NAMES = []
+        config.MODEL.AGMTLORA.RESOLVED_GROUP_SHARED_RANKS = []
+        config.MODEL.AGMTLORA.RESOLVED_GROUP_RANK_SOURCE = ""
+        config.MODEL.AGMTLORA.RESOLVED_NUM_GROUPS = 0
+        config.MODEL.AGMTLORA.RESOLVED_NUM_GROUPS_BY_STAGE = []
+        config.MODEL.AGMTLORA.RESOLVED_PARTITION_GRANULARITY = config.MODEL.AGMTLORA.PARTITION_GRANULARITY
+        config.MODEL.AGMTLORA.RESOLVED_TASK_TO_GROUP = CN(new_allowed=True)
+        config.MODEL.AGMTLORA.RESOLVED_TASK_TO_GROUP_BY_STAGE = CN(new_allowed=True)
+
+        if (
+            str(config.MODEL.AGMTLORA.GROUPING_SOURCE) == "search"
+            and str(config.MODEL.AGMTLORA.PARTITION_GRANULARITY) == "stage"
+            and str(config.MODEL.AGMTLORA.SEARCH_SCORE_SOURCE) != "group_proxy"
+        ):
+            raise ValueError(
+                "Stage-wise partition search currently requires MODEL.AGMTLORA.SEARCH_SCORE_SOURCE='group_proxy'."
+            )
+
         if str(config.MODEL.AGMTLORA.GROUPING_SOURCE) == 'fixed_json':
             if not config.MODEL.AGMTLORA.GROUPING_JSON:
                 raise ValueError("MODEL.AGMTLORA.GROUPING_JSON is required when GROUPING_SOURCE=fixed_json.")
@@ -679,41 +716,86 @@ def update_config(config, args):
                 config.MODEL.AGMTLORA.GROUPING_JSON,
                 config.TASKS,
             )
-            resolved_groups = grouping_payload["groups"]
-            resolved_task_to_group = grouping_payload["task_to_group"]
-            resolved_group_names = [f"group_{idx}" for idx in range(len(resolved_groups))]
+            resolved_partition_granularity = grouping_payload.get(
+                "partition_granularity",
+                config.MODEL.AGMTLORA.PARTITION_GRANULARITY,
+            )
+            config.MODEL.AGMTLORA.PARTITION_GRANULARITY = resolved_partition_granularity
             manual_group_ranks = config.MODEL.AGMTLORA.GROUP_SHARED_RANKS
             rank_source = ""
             if (not manual_group_ranks) and grouping_payload.get("group_shared_ranks"):
                 manual_group_ranks = grouping_payload["group_shared_ranks"]
                 rank_source = "grouping_json"
-            resolved_group_ranks, rank_source = resolve_group_shared_ranks(
-                manual_group_ranks,
-                config.MODEL.AGMTLORA.TOTAL_SHARED_RANK_BUDGET,
-                len(resolved_groups),
-                len(config.MODEL.SWIN.DEPTHS),
-                config.MODEL.AGMTLORA.GROUP_RANK_ALLOCATION,
-            )
+
+            if resolved_partition_granularity == "stage":
+                resolved_groups = []
+                resolved_groups_by_stage = grouping_payload["groups_by_stage"]
+                resolved_group_names = list(grouping_payload["group_slot_names"])
+                resolved_group_ranks, rank_source = resolve_stagewise_group_shared_ranks(
+                    manual_group_ranks,
+                    config.MODEL.AGMTLORA.TOTAL_SHARED_RANK_BUDGET,
+                    len(resolved_group_names),
+                    grouping_payload["num_groups_by_stage"],
+                    len(config.MODEL.SWIN.DEPTHS),
+                    config.MODEL.AGMTLORA.GROUP_RANK_ALLOCATION,
+                )
+                resolved_num_groups_by_stage = list(grouping_payload["num_groups_by_stage"])
+                resolved_task_to_group = {}
+                resolved_task_to_group_by_stage = grouping_payload["task_to_group_by_stage"]
+            else:
+                resolved_groups = grouping_payload["groups"]
+                resolved_groups_by_stage = []
+                resolved_task_to_group = grouping_payload["task_to_group"]
+                resolved_task_to_group_by_stage = []
+                resolved_group_names = [f"group_{idx}" for idx in range(len(resolved_groups))]
+                resolved_num_groups_by_stage = []
+                resolved_group_ranks, rank_source = resolve_group_shared_ranks(
+                    manual_group_ranks,
+                    config.MODEL.AGMTLORA.TOTAL_SHARED_RANK_BUDGET,
+                    len(resolved_groups),
+                    len(config.MODEL.SWIN.DEPTHS),
+                    config.MODEL.AGMTLORA.GROUP_RANK_ALLOCATION,
+                )
+
             if manual_group_ranks and rank_source != "grouping_json":
                 rank_source = "manual"
 
             config.MODEL.AGMTLORA.RESOLVED_GROUPS = resolved_groups
+            config.MODEL.AGMTLORA.RESOLVED_GROUPS_BY_STAGE = resolved_groups_by_stage
             config.MODEL.AGMTLORA.RESOLVED_GROUP_NAMES = resolved_group_names
+            config.MODEL.AGMTLORA.RESOLVED_GROUP_SLOT_NAMES = resolved_group_names
             config.MODEL.AGMTLORA.RESOLVED_GROUP_SHARED_RANKS = resolved_group_ranks
             config.MODEL.AGMTLORA.RESOLVED_GROUP_RANK_SOURCE = rank_source
-            config.MODEL.AGMTLORA.RESOLVED_NUM_GROUPS = len(resolved_groups)
+            config.MODEL.AGMTLORA.RESOLVED_NUM_GROUPS = (
+                len(resolved_group_names) if resolved_partition_granularity == "stage" else len(resolved_groups)
+            )
+            config.MODEL.AGMTLORA.RESOLVED_NUM_GROUPS_BY_STAGE = resolved_num_groups_by_stage
+            config.MODEL.AGMTLORA.RESOLVED_PARTITION_GRANULARITY = resolved_partition_granularity
             config.MODEL.AGMTLORA.RESOLVED_TASK_TO_GROUP = CN(new_allowed=True)
             for task, group_name in resolved_task_to_group.items():
                 config.MODEL.AGMTLORA.RESOLVED_TASK_TO_GROUP[task] = group_name
+            config.MODEL.AGMTLORA.RESOLVED_TASK_TO_GROUP_BY_STAGE = CN(new_allowed=True)
+            for stage_idx, task_to_group in enumerate(resolved_task_to_group_by_stage):
+                stage_key = stage_index_to_key(stage_idx)
+                config.MODEL.AGMTLORA.RESOLVED_TASK_TO_GROUP_BY_STAGE[stage_key] = CN(new_allowed=True)
+                for task, group_name in task_to_group.items():
+                    config.MODEL.AGMTLORA.RESOLVED_TASK_TO_GROUP_BY_STAGE[stage_key][task] = group_name
 
             config.MODEL.MTLORA.AGMTLORA_ENABLED = True
             config.MODEL.MTLORA.AGMTLORA_STAGE = int(config.MODEL.AGMTLORA.STAGE)
+            config.MODEL.MTLORA.AGMTLORA_PARTITION_GRANULARITY = resolved_partition_granularity
             config.MODEL.MTLORA.AGMTLORA_GROUPS = resolved_groups
             config.MODEL.MTLORA.AGMTLORA_GROUP_NAMES = resolved_group_names
             config.MODEL.MTLORA.AGMTLORA_GROUP_RANKS = resolved_group_ranks
             config.MODEL.MTLORA.AGMTLORA_TASK_TO_GROUP = CN(new_allowed=True)
             for task, group_name in resolved_task_to_group.items():
                 config.MODEL.MTLORA.AGMTLORA_TASK_TO_GROUP[task] = group_name
+            config.MODEL.MTLORA.AGMTLORA_TASK_TO_GROUP_BY_STAGE = CN(new_allowed=True)
+            for stage_idx, task_to_group in enumerate(resolved_task_to_group_by_stage):
+                stage_key = stage_index_to_key(stage_idx)
+                config.MODEL.MTLORA.AGMTLORA_TASK_TO_GROUP_BY_STAGE[stage_key] = CN(new_allowed=True)
+                for task, group_name in task_to_group.items():
+                    config.MODEL.MTLORA.AGMTLORA_TASK_TO_GROUP_BY_STAGE[stage_key][task] = group_name
     config.freeze()
 
 

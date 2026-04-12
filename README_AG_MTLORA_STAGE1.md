@@ -465,3 +465,84 @@ python -m torch.distributed.launch --nproc_per_node 1 main.py \
 - 默认配置和当前实现主要面向 4-task PASCAL / NYUD 小任务数场景，因此 partition search 采用穷举。
 - 当前 AG 路由重点覆盖 QKV、Proj、FC1、FC2 等 TA-LoRA 注入位置；默认配置中 `MODEL.MTLORA.DOWNSAMPLER_ENABLED=False`，这也是当前推荐设置。
 - 如果后续扩展到 Stage-2 或 stage-wise grouping，优先修改 `models/swin_transformer_mtlora.py` 中的 task routing 和 `config.py` 中的 group rank / grouping 解析逻辑。
+
+## 11. Stage-Wise Partition（group_proxy only）
+
+当前仓库已经支持一个最小改动版的 stage-wise partition 路径，但有明确边界：
+
+- 只支持 `MODEL.AGMTLORA.PARTITION_GRANULARITY=stage`
+- 只支持 `MODEL.AGMTLORA.SEARCH_SCORE_SOURCE=group_proxy`
+- 不支持 `stage + final_predictions`
+- Stage-2 训练仍然推荐直接使用 Stage-1 自动生成的 resolved config，而不是手写 fixed-json 训练配置
+
+仓库内已经补了两份可直接使用的 Stage-1 样例：
+
+- `configs/mtlora/tiny_448/pascal/ag_mtlora_stage1_tiny_448_r64_scale4_pertask_stagewise_proxy.yaml`
+- `configs/mtlora/tiny_448/nyud/ag_mtlora_stage1_tiny_448_r64_scale4_pertask_nyud_stagewise_proxy.yaml`
+
+这两份配置的核心开关是：
+
+```yaml
+MODEL:
+  AGMTLORA:
+    GROUPING_SOURCE: search
+    PARTITION_GRANULARITY: stage
+    SEARCH_SCORE_SOURCE: group_proxy
+    MAX_GROUPS: 2
+    TOTAL_SHARED_RANK_BUDGET: 64
+```
+
+语义上它表示：
+
+- Stage-1 先按 stage 拆分 shared TA-LoRA affinity
+- 每个 stage 独立构造自己的 `group_proxy`
+- 每个 stage 独立运行一次现有的 partition exhaustive search
+- group slot 名字固定为 `group_0 .. group_{MAX_GROUPS-1}`
+- 某个 slot 如果在某个 stage 没被用到，该 stage 上的 shared rank 自动置 0
+
+Stage-wise 模式下，Step-1 的关键输出会变成：
+
+- `affinity.json`
+  - 额外包含 `directed_affinity_by_stage`
+- `group_proxy.json`
+  - 额外包含 `group_proxy_by_stage`
+- `partition_search_results__group_proxy.json`
+  - 包含 `ranked_partitions_by_stage`
+- `grouping__group_proxy.json`
+  - 包含 `partition_granularity`
+  - 包含 `group_slot_names`
+  - 包含 `groups_by_stage`
+  - 包含 `task_to_group_by_stage`
+  - 包含 `num_groups_by_stage`
+  - 包含按 `[slot][stage]` 排布的 `group_shared_ranks`
+
+运行建议：
+
+1. Step-1 直接使用新的 stage-wise 样例 YAML。
+2. Step-2 直接使用输出目录里的 `resolved_agmtlora_config__group_proxy.yaml`。
+3. 如果想手动接管训练配置，再把 `GROUPING_SOURCE` 改成 `fixed_json`，并指向生成的 `grouping__group_proxy.json`。
+
+PASCAL 四任务示例：
+
+```bash
+python scripts/ag_mtlora_stage1_prepare.py \
+  --cfg configs/mtlora/tiny_448/pascal/ag_mtlora_stage1_tiny_448_r64_scale4_pertask_stagewise_proxy.yaml \
+  --pascal /path/to/PASCAL_MT \
+  --tasks semseg,normals,sal,human_parts \
+  --batch-size 8 \
+  --resume-backbone backbone/swin_tiny_patch4_window7_224.pth
+```
+
+随后训练：
+
+```bash
+python -m torch.distributed.launch --nproc_per_node 1 main.py \
+  --cfg /abs/path/to/output/ag_mtlora_stage1_prepare/run_xxx/resolved_agmtlora_config__group_proxy.yaml \
+  --pascal /path/to/PASCAL_MT \
+  --tasks semseg,normals,sal,human_parts \
+  --batch-size 8 \
+  --epochs 300 \
+  --ckpt-freq 20 \
+  --eval-freq 5 \
+  --resume /abs/path/to/output/ag_mtlora_stage1_prepare/run_xxx/post_affinity_checkpoint.pth
+```

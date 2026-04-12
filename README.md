@@ -102,12 +102,28 @@ Kept MTLoRA configs:
 - `configs/mtlora/tiny_448/pascal/mtlora_tiny_448_r64_scale4_pertask_r64.yaml`
 - `configs/mtlora/base_448/pascal/mtlora_base_448_r64_scale4_pertask.yaml`
 - `configs/mtlora/tiny_448/nyud/mtlora_tiny_448_r64_scale4_pertask_nyud.yaml`
+- `configs/mtlora/tiny_448/pascal/ag_mtlora_stage1_tiny_448_r64_scale4_pertask.yaml`
+- `configs/mtlora/tiny_448/nyud/ag_mtlora_stage1_tiny_448_r64_scale4_pertask_nyud.yaml`
+- `configs/mtlora/tiny_448/pascal/ag_mtlora_stage1_tiny_448_r64_scale4_pertask_stagewise_proxy.yaml`
+- `configs/mtlora/tiny_448/nyud/ag_mtlora_stage1_tiny_448_r64_scale4_pertask_nyud_stagewise_proxy.yaml`
 
 Standard Swin baselines are kept under `configs/swin/`.
 
 ## Utilities
 
-AG-MTLoRA Stage-1 specific workflow, search configuration, and replay-search usage are documented in `README_AG_MTLORA_STAGE1.md`.
+AG-MTLoRA Stage-1 specific workflow, search configuration, replay-search usage, and the new stage-wise partition mode are documented in `README_AG_MTLORA_STAGE1.md`.
+
+Stage-wise partition example configs:
+
+- PASCAL: `configs/mtlora/tiny_448/pascal/ag_mtlora_stage1_tiny_448_r64_scale4_pertask_stagewise_proxy.yaml`
+- NYUD: `configs/mtlora/tiny_448/nyud/ag_mtlora_stage1_tiny_448_r64_scale4_pertask_nyud_stagewise_proxy.yaml`
+
+These example configs set:
+
+- `MODEL.AGMTLORA.PARTITION_GRANULARITY=stage`
+- `MODEL.AGMTLORA.SEARCH_SCORE_SOURCE=group_proxy`
+
+Step-2 training still uses the Stage-1 generated resolved config, for example `resolved_agmtlora_config__group_proxy.yaml`.
 
 Compute Delta-m from logs:
 

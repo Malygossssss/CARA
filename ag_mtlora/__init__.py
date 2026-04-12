@@ -1,21 +1,31 @@
 from .config_utils import (
+    build_task_to_group_by_stage,
     build_task_to_group,
     canonicalize_groups,
+    DEFAULT_PARTITION_GRANULARITY,
     enumerate_candidate_groups,
     enumerate_partitions,
     group_display_name,
     load_grouping_json,
+    normalize_partition_granularity,
     resolve_group_shared_ranks,
+    resolve_stagewise_group_shared_ranks,
     select_predictor_train_groups,
+    stage_index_to_key,
 )
 
 __all__ = [
+    "build_task_to_group_by_stage",
     "build_task_to_group",
     "canonicalize_groups",
+    "DEFAULT_PARTITION_GRANULARITY",
     "enumerate_candidate_groups",
     "enumerate_partitions",
     "group_display_name",
     "load_grouping_json",
+    "normalize_partition_granularity",
     "resolve_group_shared_ranks",
+    "resolve_stagewise_group_shared_ranks",
     "select_predictor_train_groups",
+    "stage_index_to_key",
 ]
