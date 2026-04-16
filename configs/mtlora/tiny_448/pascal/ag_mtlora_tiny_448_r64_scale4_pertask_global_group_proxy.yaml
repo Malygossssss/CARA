@@ -2,7 +2,7 @@ DATA:
   IMG_SIZE: 448
 MODEL:
   TYPE: swin
-  NAME: ag_mtlora_stage1_tiny_448_r64_scale4_pertask
+  NAME: ag_mtlora_tiny_448_r64_scale4_pertask_global_group_proxy
   DROP_PATH_RATE: 0.2
   SWIN:
     EMBED_DIM: 96
@@ -40,13 +40,13 @@ MODEL:
     META_VAL_RATIO: 0.2
     PARTITION_GRANULARITY: global
     SEARCH_SCORE_SOURCE: group_proxy
-    MAX_GROUPS: 2
+    MAX_GROUPS: 3
     TOTAL_SHARED_RANK_BUDGET: 64
     GROUP_RANK_ALLOCATION: equal_split
     GROUPING_SOURCE: search
     AFFINITY_WARMUP_EPOCHS: 5
     AFFINITY_SCORE_EPOCHS: 50
-    SEARCH_OBJECTIVE: mean_final_predicted_gain
+    SEARCH_OBJECTIVE: mean_group_proxy
     PREDICTOR_TRAIN_GROUP_BUDGET: 10
     PREDICTOR_TRAIN_GROUP_STRATEGY: all_singletons+all_pairs+random_higher_order
     PREDICTOR_GROUP_TRAIN_EPOCHS: 5
